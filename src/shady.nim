@@ -4,3 +4,10 @@ import shady/backends/[shared, glsl, glsl3, glsl4, dx12, metal4, vulkan]
 import shady/binary
 
 export shared, glsl, glsl3, glsl4, dx12, metal4, vulkan, binary
+
+when not defined(shadyNoPixie):
+  # CPU-simulation runtime (image samplers, texture/imageStore on the CPU).
+  # Depends on pixie; omit with -d:shadyNoPixie on pixie-less targets (e.g. 3DS
+  # shader codegen) so pixie is not compiled into the binary.
+  import shady/backends/cpusim
+  export cpusim

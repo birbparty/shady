@@ -1,8 +1,7 @@
 ## Shader macro, converts Nim code into shader source.
 
-import macros, pixie, strutils, tables, vmath
+import macros, strutils, tables, vmath
 import shady/backends/[glsl, glsl3, glsl4, dx12, metal4, vulkan]
-from chroma import ColorRGBX
 
 type
   ShaderTarget* = enum
@@ -1526,26 +1525,12 @@ type
   SamplerBuffer* = object
     data*: seq[float32]
 
-  ImageBuffer* = object
-    image*: Image
-
-  UImageBuffer* = object
-    image*: Image
-
-  Sampler2d* = object
-    image*: Image
-
-  SamplerCube* = object
-    faces*: array[6, Image]
-
-  Sampler2dShadow* = object
-    image*: Image
-
-  USampler2d* = object
-    image*: Image
-
-  Sampler2dArray* = object
-    images*: seq[Image]
+# NOTE: The Image-backed sampler types (Sampler2d, ImageBuffer, SamplerCube,
+# etc.) and their CPU-simulation runtime procs (texture/imageStore/texelFetch
+# on images, etc.) live in `shady/backends/cpusim` — they depend on `pixie`.
+# Keeping them out of this module lets the shader *codegen* be imported on
+# targets (e.g. Nintendo 3DS / -d:ds3) without compiling pixie into the binary.
+# `import shady` re-exports cpusim by default; pass -d:shadyNoPixie to omit it.
 
 var
   ## GLSL globals.
@@ -1585,53 +1570,6 @@ proc `+`*(a, b: Mat4): Mat4 =
 
 proc texelFetch*(buffer: Uniform[SamplerBuffer], index: SomeInteger): Vec4 =
   vec4(buffer.data[index.int], 0, 0, 0)
-
-proc texelFetch*(buffer: Uniform[Sampler2D], pos: IVec2, level: int): Vec4 =
-  let c = buffer.image[pos.x.int, pos.y.int]
-  return vec4(c.r.float32/255, c.g.float32/255, c.b.float32/255, c.a.float32/255)
-
-proc texelFetch*(buffer: Uniform[USampler2D], pos: IVec2, level: int): UVec4 =
-  ## CPU stub for usampler2D; not used at runtime. Returns zeros.
-  uvec4(0u32, 0u32, 0u32, 0u32)
-
-proc imageLoad*(
-  buffer: var UniformWriteOnly[UImageBuffer], index: int32
-): UVec4 =
-  result.x = buffer.image.data[index.int].r
-  result.g = buffer.image.data[index.int].g
-  result.b = buffer.image.data[index.int].b
-  result.a = buffer.image.data[index.int].a
-
-proc imageStore*(buffer: var UniformWriteOnly[UImageBuffer], index: int32,
-    color: UVec4) =
-  buffer.image.data[index.int].r = clamp(color.x, 0, 255).uint8
-  buffer.image.data[index.int].g = clamp(color.y, 0, 255).uint8
-  buffer.image.data[index.int].b = clamp(color.z, 0, 255).uint8
-  buffer.image.data[index.int].a = clamp(color.w, 0, 255).uint8
-
-proc imageStore*(buffer: var UniformWriteOnly[ImageBuffer], index: int32,
-    color: Vec4) =
-  buffer.image.data[index.int].r = clamp(color.x*255, 0, 255).uint8
-  buffer.image.data[index.int].g = clamp(color.y*255, 0, 255).uint8
-  buffer.image.data[index.int].b = clamp(color.z*255, 0, 255).uint8
-  buffer.image.data[index.int].a = clamp(color.w*255, 0, 255).uint8
-
-proc imageStore*(buffer: var Uniform[Sampler2D], pos: IVec2,
-    color: Vec4) =
-  buffer.image[pos.x.int, pos.y.int] = rgbx(
-    clamp(color.x*255, 0, 255).uint8,
-    clamp(color.y*255, 0, 255).uint8,
-    clamp(color.z*255, 0, 255).uint8,
-    clamp(color.w*255, 0, 255).uint8,
-  )
-
-proc vec4*(c: ColorRGBX): Vec4 =
-  vec4(
-    c.r.float32/255,
-    c.g.float32/255,
-    c.b.float32/255,
-    c.a.float32/255
-  )
 
 proc dFdx*(a: float32): float32 =
   raise newException(Exception, "dFdx is not implemented")
@@ -1715,54 +1653,8 @@ proc smoothstep*(a, b, x: Vec3): Vec3 =
 proc smoothstep*(a, b, x: Vec4): Vec4 =
   vec4(smoothstep(a.x, b.x, x.x), smoothstep(a.y, b.y, x.y), smoothstep(a.z, b.z, x.z), smoothstep(a.w, b.w, x.w))
 
-proc texture*(buffer: Uniform[Sampler2D], pos: Vec2): Vec4 =
-  let pos = pos - vec2(0.5 / buffer.image.width.float32, 0.5 /
-      buffer.image.height.float32)
-  buffer.image.getRgbaSmooth(
-    ((pos.x mod 1.0) * buffer.image.width.float32),
-    ((pos.y mod 1.0) * buffer.image.height.float32)
-  ).vec4()
-
-proc texture*(buffer: Uniform[SamplerCube], pos: Vec3): Vec4 =
-  ## CPU stub for samplerCube; not used at runtime. Returns opaque black.
-  vec4(0, 0, 0, 1)
-
-proc texture*(buffer: Uniform[Sampler2dShadow], pos: Vec3): float32 =
-  ## CPU stub for sampler2DShadow; not used at runtime. Returns fully lit.
-  1.0
-
-proc textureLod*(buffer: Uniform[SamplerCube], pos: Vec3, lod: float32): Vec4 =
-  ## CPU stub for samplerCube textureLod; not used at runtime.
-  texture(buffer, pos)
-
 proc reflect*(incident, normal: Vec3): Vec3 =
   incident - 2.0'f * dot(normal, incident) * normal
-
-proc textureSize*(buffer: Uniform[Sampler2D], level: int): Vec2 =
-  vec2(buffer.image.width.float32, buffer.image.height.float32)
-
-proc textureSize*(buffer: Uniform[SamplerCube], level: int): Vec2 =
-  let image = buffer.faces[0]
-  vec2(image.width.float32, image.height.float32)
-
-proc textureSize*(buffer: Uniform[Sampler2dShadow], level: int): Vec2 =
-  vec2(buffer.image.width.float32, buffer.image.height.float32)
-
-proc textureGrad*(
-  s: Uniform[Sampler2D],
-  uv: Vec3,
-  dUVdx: Vec2,
-  dUVdy: Vec2
-): Vec4 =
-  texture(s, uv.xy)
-
-proc textureGrad*(
-  s: Uniform[Sampler2DArray],
-  uvw: Vec3,
-  dUVdx: Vec2,
-  dUVdy: Vec2
-): Vec4 =
-  vec4(0, 0, 0, 0)
 
 proc discardFragment*() =
   discard
