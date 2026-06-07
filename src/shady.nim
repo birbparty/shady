@@ -1,9 +1,11 @@
 ## Public switchboard for Shady's shader backends.
 
 import shady/backends/[shared, glsl, glsl3, glsl4, dx12, metal4, vulkan]
+import shady/backends/tev
 import shady/binary
 
 export shared, glsl, glsl3, glsl4, dx12, metal4, vulkan, binary
+export tev   # PICA200 TEV fragment-config recognizer (Nintendo 3DS)
 
 when not defined(shadyNoPixie):
   # CPU-simulation runtime (image samplers, texture/imageStore on the CPU).
