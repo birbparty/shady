@@ -1539,6 +1539,13 @@ macro toPica*(s: typed): string =
   ## stage (see backends/pica200.nim and the 3DS plan).
   newLit(toShaderInner(s, pica200Vsh, shaderVertex))
 
+macro toGeoPica*(s: typed): string =
+  ## Converts a geometry-shader proc to PICA200 picasso (.g.pica) assembly for
+  ## the Nintendo 3DS. The proc takes a `Primitive[N, T]` input and emits output
+  ## vertices via `emitVertex`/`endPrimitive`. Its own entry point (the macro IS
+  ## the stage); see backends/pica200.nim and the geometry-shaders-3ds plan.
+  newLit(toGeoPicaInner(s))
+
 macro toPicaShbin*(s: typed): string =
   ## Like `toPica`, but assembles the shader with `picasso` at Nim-compile time
   ## and returns the resulting `.shbin` *bytes* as a string const — so a 3DS
@@ -1575,6 +1582,22 @@ type
 
   SamplerBuffer* = object
     data*: seq[float32]
+
+  Primitive*[N: static int, T] = array[N, T]
+    ## PICA200 geometry-shader input primitive: `N` vertices of type `T`. `T` is
+    ## an object whose fields (in declaration order) are the per-vertex input
+    ## registers — these mirror the pass-through vertex shader's outputs. See
+    ## `toGeoPica` and `.agents/plans/geometry-shaders-3ds/`.
+
+proc emitVertex*(position: Vec4, color: Vec4) =
+  ## Geometry-shader: emit one output vertex (clip-space `position` + `color`).
+  ## CPU no-op; recognized by `toGeoPica` and lowered to `setemit`/`emit`.
+  discard
+
+proc endPrimitive*() =
+  ## Geometry-shader: finish the current output primitive (flags the last emit
+  ## with the PICA `prim` marker). CPU no-op; recognized by `toGeoPica`.
+  discard
 
 # NOTE: The Image-backed sampler types (Sampler2d, ImageBuffer, SamplerCube,
 # etc.) and their CPU-simulation runtime procs (texture/imageStore/texelFetch

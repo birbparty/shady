@@ -46,6 +46,11 @@ type
                                        ## (uniforms + consts) — forbidden in src2
     locals: Table[string, string]      ## local var/let name -> temp register
     loopConsts: Table[string, int]     ## unrolled for-loop var -> current value
+    # Geometry-shader state (toGeoPica):
+    primParam: string                  ## the Primitive[N,T] param name
+    primFields: seq[string]            ## per-vertex field names (declaration order)
+    geoEmitIndex: int                  ## next setemit index (0..2 within a primitive)
+    geoLastSetemit: int                ## ctx.instrs index of the last `setemit`
 
 proc fail(msg: string, n: NimNode) {.noreturn.} =
   error("[Shady/PICA200] " & msg, n)
@@ -263,6 +268,20 @@ proc lower(ctx: var Ctx, n: NimNode): string =
   of nnkIntLit .. nnkInt64Lit:
     return ctx.scalarConst(n.intVal.float)
   of nnkDotExpr:
+    # Geometry input access: prim[<const>].<field> -> input register vN.
+    # (Must resolve before the swizzle path, which would reject the field name.)
+    if ctx.primParam.len > 0 and n[0].kind == nnkBracketExpr and
+       n[0][0].kind in {nnkSym, nnkIdent} and n[0][0].strVal == ctx.primParam:
+      var idxNode = n[0][1]
+      while idxNode.kind in {nnkHiddenStdConv, nnkConv, nnkChckRange}:
+        idxNode = idxNode[^1]
+      if idxNode.kind notin {nnkIntLit .. nnkInt64Lit}:
+        fail("geometry input index must be a constant: " & n[0][1].repr, n)
+      let fieldIdx = ctx.primFields.find(n[1].strVal)
+      if fieldIdx < 0:
+        fail("'" & n[1].strVal & "' is not a vertex field of the primitive", n)
+      let reg = idxNode.intVal.int * ctx.primFields.len + fieldIdx
+      return "v" & $reg
     let base = ctx.lower(n[0])
     let sw = swizzleOf(n[1].strVal)
     if sw.len == 0: fail("unsupported swizzle/field: " & n[1].repr, n)
@@ -363,6 +382,18 @@ proc isUniformMat4(ctx: Ctx, n: NimNode): bool =
   (n.kind in {nnkSym, nnkIdent}) and n.strVal in ctx.uniforms and
     ctx.uniforms[n.strVal].size == 4
 
+proc assignToReg(ctx: var Ctx, dst: string, rhs: NimNode) =
+  ## Assign an expression to a specific output register. Shared by output-param
+  ## assignment and geometry `emitVertex`. Handles the mat4*vec4 -> 4×dp4 case.
+  if rhs.kind == nnkInfix and rhs[0].strVal == "*" and ctx.isUniformMat4(rhs[1]):
+    let mat = rhs[1].strVal
+    let vec = ctx.lower(rhs[2])
+    for i, comp in ["x", "y", "z", "w"]:
+      ctx.instrs.add "dp4 " & dst & "." & comp & ", " & mat & "[" & $i & "], " & vec
+    return
+  let src = ctx.lower(rhs)
+  ctx.instrs.add "mov " & dst & ", " & src
+
 proc lowerAssign(ctx: var Ctx, lhs, rhs: NimNode) =
   # The LHS of a `var`-param write is wrapped in a hidden deref.
   var lnode = lhs
@@ -380,19 +411,7 @@ proc lowerAssign(ctx: var Ctx, lhs, rhs: NimNode) =
 
   if lname notin ctx.outputs:
     fail("assignment target is not a declared output or local: " & lname, lhs)
-  let dst = ctx.outputs[lname].reg
-
-  # Special case: out = mat4 * vec4  ->  four dp4 directly into the output.
-  if rhs.kind == nnkInfix and rhs[0].strVal == "*" and ctx.isUniformMat4(rhs[1]):
-    let mat = rhs[1].strVal
-    let vec = ctx.lower(rhs[2])
-    for i, comp in ["x", "y", "z", "w"]:
-      ctx.instrs.add "dp4 " & dst & "." & comp & ", " & mat & "[" & $i & "], " & vec
-    return
-
-  # General case: compute rhs, mov into the output (all four lanes).
-  let src = ctx.lower(rhs)
-  ctx.instrs.add "mov " & dst & ", " & src
+  ctx.assignToReg(ctx.outputs[lname].reg, rhs)
 
 proc lowerStmt(ctx: var Ctx, stmt: NimNode)   # forward (mutual recursion)
 
@@ -510,6 +529,30 @@ proc lowerFor(ctx: var Ctx, n: NimNode) =
     ctx.lowerStmt(n[2])
   ctx.loopConsts.del(name)
 
+# --- geometry emission: emitVertex / endPrimitive ---------------------------
+
+proc lowerEmitVertex(ctx: var Ctx, call: NimNode) =
+  ## emitVertex(position, color) -> setemit N; write outpos/outclr; emit.
+  if call.len != 3:
+    fail("emitVertex expects (position, color)", call)
+  if ctx.geoEmitIndex > 2:
+    fail("a PICA200 output primitive can emit at most 3 vertices " &
+         "(setemit 0..2); call endPrimitive() to start a new one", call)
+  ctx.instrs.add "setemit " & $ctx.geoEmitIndex
+  ctx.geoLastSetemit = ctx.instrs.high
+  ctx.assignToReg("outpos", call[1])
+  ctx.assignToReg("outclr", call[2])
+  ctx.instrs.add "emit"
+  inc ctx.geoEmitIndex
+
+proc lowerEndPrimitive(ctx: var Ctx, n: NimNode) =
+  ## Flag the most recent setemit with `, prim` and reset the emit index.
+  if ctx.geoLastSetemit < 0:
+    fail("endPrimitive() with no preceding emitVertex()", n)
+  ctx.instrs[ctx.geoLastSetemit] = ctx.instrs[ctx.geoLastSetemit] & ", prim"
+  ctx.geoEmitIndex = 0
+  ctx.geoLastSetemit = -1
+
 proc lowerStmt(ctx: var Ctx, stmt: NimNode) =
   case stmt.kind
   of nnkAsgn:
@@ -518,6 +561,13 @@ proc lowerStmt(ctx: var Ctx, stmt: NimNode) =
     ctx.lowerIf(stmt)
   of nnkForStmt:
     ctx.lowerFor(stmt)
+  of nnkCall, nnkCommand:
+    # Geometry emission verbs (only valid in a toGeoPica proc).
+    case stmt[0].strVal
+    of "emitVertex": ctx.lowerEmitVertex(stmt)
+    of "endPrimitive": ctx.lowerEndPrimitive(stmt)
+    else:
+      fail("unsupported call '" & stmt[0].strVal & "' at statement level", stmt)
   of nnkVarSection, nnkLetSection:
     ctx.lowerLocalSection(stmt)
   of nnkCommentStmt, nnkEmpty, nnkDiscardStmt:
@@ -644,6 +694,77 @@ proc toPicaInner*(s: NimNode): string =
   for d in ctx.decls:
     result.add d & "\n"
   result.add "\n.proc main\n"
+  for ins in ctx.instrs:
+    result.add "\t" & ins & "\n"
+  result.add "\tend\n"
+  result.add ".end\n"
+
+# ===========================================================================
+# Geometry shader backend (toGeoPica) — Nintendo 3DS PICA200 .g.pica
+# ===========================================================================
+
+proc geoGather(ctx: var Ctx, formalParams: NimNode) =
+  for identDefs in formalParams:
+    if identDefs.kind != nnkIdentDefs: continue
+    let typeNode = identDefs[^2]
+    for i in 0 ..< identDefs.len - 2:
+      let name = identDefs[i].strVal
+      if typeNode.kind == nnkBracketExpr and typeNode[0].repr == "Primitive":
+        # Primitive[N, VertexT]: introspect VertexT's fields (declaration order)
+        # -> per-vertex input registers. Field k of vertex j is v(j*nFields + k).
+        ctx.primParam = name
+        let td = typeNode[2].getImpl     # nnkTypeDef -> [name, generics, ObjectTy]
+        if td.kind != nnkTypeDef or td[2].kind != nnkObjectTy:
+          fail("Primitive vertex type must be an object", identDefs)
+        for field in td[2][2]:           # ObjectTy -> recList
+          if field.kind == nnkIdentDefs:
+            for j in 0 ..< field.len - 2:
+              ctx.primFields.add field[j].strVal
+      elif isUniformType(typeNode):
+        let inner = uniformInner(typeNode)
+        if "Mat4" in inner:
+          ctx.uniforms[name] = UniformInfo(base: ctx.cReg, size: 4)
+          ctx.cbankNames.incl name
+          ctx.decls.add ".fvec " & name & "[4]"
+          ctx.cReg += 4
+        elif "Vec4" in inner or "Vec3" in inner or "Vec2" in inner:
+          ctx.uniforms[name] = UniformInfo(base: ctx.cReg, size: 1)
+          ctx.cbankNames.incl name
+          ctx.decls.add ".fvec " & name
+          ctx.cReg += 1
+        else:
+          fail("unsupported uniform type for PICA200 geometry: " & inner, identDefs)
+
+proc toGeoPicaInner*(s: NimNode): string =
+  ## Entry point: `s` is a typed geometry-shader proc. Returns picasso .g.pica.
+  let impl = s.getImpl()
+  if impl.kind notin {nnkProcDef, nnkFuncDef}:
+    fail("toGeoPica expects a proc", s)
+  let formalParams = impl.params
+  let body = impl.body
+  if formalParams.kind != nnkFormalParams: fail("proc has no parameters", impl)
+  if body.kind == nnkEmpty: fail("geometry proc has no body", impl)
+
+  var ctx = Ctx(geoLastSetemit: -1)
+  ctx.geoGather(formalParams)
+  if ctx.primParam.len == 0:
+    fail("a PICA200 geometry proc must take a Primitive[N, T] input", impl)
+  # v1 outputs (emitVertex writes these).
+  ctx.decls.add ".out outpos position"
+  ctx.decls.add ".out outclr color"
+  ctx.lowerBody(body)
+  ctx.allocateRegisters(impl)
+
+  when defined(shadyPicaDebug):
+    echo "--- GEO AST ---"
+    echo impl.treeRepr
+
+  result.add "; Generated by Shady toGeoPica (PICA200 geometry shader)\n"
+  result.add "; from " & s.strVal & "\n\n"
+  result.add ".gsh point c0\n"
+  for d in ctx.decls:
+    result.add d & "\n"
+  result.add "\n.entry gmain\n.proc gmain\n"
   for ins in ctx.instrs:
     result.add "\t" & ins & "\n"
   result.add "\tend\n"
