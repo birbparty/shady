@@ -52,7 +52,10 @@ Shady uses:
 # Nintendo 3DS / PICA200 (experimental)
 
 Shady can compile a **vertex** shader proc to [PICA200](https://www.3dbrew.org/wiki/GPU)
-picasso assembly (`.v.pica`) for the Nintendo 3DS via `toPica`:
+picasso assembly (`.v.pica`) for the Nintendo 3DS via `toPica`. A shader generated
+this way has been verified rendering on **real 3DS hardware** (a Shady-generated
+2D atlas vertex shader drop-in to [boxy](https://github.com/treeform/boxy)'s
+citro3d backend renders identically to the hand-written one).
 
 ```nim
 import shady, vmath
