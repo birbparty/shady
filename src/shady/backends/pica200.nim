@@ -49,7 +49,11 @@ proc fail(msg: string, n: NimNode) {.noreturn.} =
   error("[Shady/PICA200] " & msg, n)
 
 proc newTemp(ctx: var Ctx): string =
-  result = "r" & $ctx.tempCount
+  ## A *virtual* temp ("vt0", "vt1", …). The register-allocation pass
+  ## (allocateRegisters) maps these to physical r0–r15, reusing registers once a
+  ## virtual temp is dead. The "vt" prefix never collides with a real PICA
+  ## register/output name (v0, outtc0, …).
+  result = "vt" & $ctx.tempCount
   inc ctx.tempCount
 
 # --- constant pooling -------------------------------------------------------
@@ -82,18 +86,46 @@ proc baseToken(operand: string): string =
 proc isCbank(ctx: Ctx, operand: string): bool =
   baseToken(operand) in ctx.cbankNames
 
+proc isInput(operand: string): bool =
+  ## True for a vertex-attribute register operand (v0..v15), not a temp (vtN).
+  let b = baseToken(operand)
+  b.len >= 2 and b[0] == 'v' and b[1] != 't' and
+    b[1 .. ^1].allCharsInSet({'0'..'9'})
+
+proc materialize(ctx: var Ctx, operand: string): string =
+  ## mov `operand` into a fresh temp; return the temp.
+  let r = ctx.newTemp()
+  ctx.instrs.add "mov " & r & ", " & operand
+  r
+
+proc capReadPorts(ctx: var Ctx, ops: var seq[string]) =
+  ## Enforce the PICA read-port limit: at most one distinct input (v) register
+  ## and at most one c-bank (uniform/const) register per instruction. The same
+  ## register reused in two slots is fine; a *different* one must be moved to a
+  ## temp first. (Verified against picasso.)
+  var keptInput = ""
+  var keptC = ""
+  for i in 0 ..< ops.len:
+    let bt = baseToken(ops[i])
+    if isInput(ops[i]):
+      if keptInput == "" or keptInput == bt: keptInput = bt
+      else: ops[i] = ctx.materialize(ops[i])
+    elif ctx.isCbank(ops[i]):
+      if keptC == "" or keptC == bt: keptC = bt
+      else: ops[i] = ctx.materialize(ops[i])
+
 proc emitBinary(ctx: var Ctx, op, a, b: string, commutative: bool): string =
-  ## Emit `op dst, src1, src2` honoring the rule that src2 cannot be c-bank.
-  ## Returns the destination temp.
-  var sa = a
-  var sb = b
-  if ctx.isCbank(sb):
+  ## Emit `op dst, src1, src2` honoring the PICA operand rules: ≤1 input and ≤1
+  ## c-bank read per instruction, and src2 may not be a c-bank register.
+  var ops = @[a, b]
+  ctx.capReadPorts(ops)              # legalize read ports first
+  var sa = ops[0]
+  var sb = ops[1]
+  if ctx.isCbank(sb):                # src2 cannot be c-bank
     if commutative and not ctx.isCbank(sa):
-      swap sa, sb                      # move the c-bank operand into src1
+      swap sa, sb
     else:
-      let r = ctx.newTemp()            # materialize the c-bank operand
-      ctx.instrs.add "mov " & r & ", " & sb
-      sb = r
+      sb = ctx.materialize(sb)
   let t = ctx.newTemp()
   ctx.instrs.add op & " " & t & ", " & sa & ", " & sb
   t
@@ -256,23 +288,42 @@ proc lower(ctx: var Ctx, n: NimNode): string =
     let op = n[0].strVal
     case op
     of "+":
+      # Fuse  a*b + c  ->  mad t, a, b, c  (one instruction). PICA `mad`'s first
+      # multiplicand (s1) may NOT be c-bank, but s2/s3 may — the opposite of
+      # `mul` (verified with picasso). Pick the operand shape that satisfies it.
+      let lMul = n[1].kind == nnkInfix and n[1][0].strVal == "*"
+      let rMul = n[2].kind == nnkInfix and n[2][0].strVal == "*"
+      if lMul or rMul:
+        let mulN = if lMul: n[1] else: n[2]
+        let addN = if lMul: n[2] else: n[1]
+        var ops = @[ctx.lower(mulN[1]), ctx.lower(mulN[2]), ctx.lower(addN)]
+        ctx.capReadPorts(ops)        # ≤1 input, ≤1 c-bank across the 3 sources
+        var a = ops[0]               # s1 (first multiplicand)
+        var b = ops[1]               # s2
+        let c = ops[2]               # s3
+        if ctx.isCbank(a):           # mad's s1 may NOT be c-bank
+          if not ctx.isCbank(b):
+            swap a, b                # mul is commutative
+          else:
+            a = ctx.materialize(a)
+        let t = ctx.newTemp()
+        ctx.instrs.add "mad " & t & ", " & a & ", " & b & ", " & c
+        return t
       return ctx.emitBinary("add", ctx.lower(n[1]), ctx.lower(n[2]),
         commutative = true)
     of "*":
       return ctx.emitBinary("mul", ctx.lower(n[1]), ctx.lower(n[2]),
         commutative = true)
     of "-":
-      # a - b  ->  add a, -b. Negation is an src2 modifier, so b must first be
-      # reachable in src2 (not c-bank): materialize it if needed via emitBinary's
-      # rule, then negate. Simplest correct form: compute b into a temp when it
-      # is c-bank, else negate in place.
-      var b = ctx.lower(n[2])
+      # a - b  ->  add a, -b. Negation is an src2 modifier, so b sits in src2 —
+      # which may not be c-bank; and the pair must obey the read-port limit.
+      var ops = @[ctx.lower(n[1]), ctx.lower(n[2])]
+      ctx.capReadPorts(ops)
+      var b = ops[1]
       if ctx.isCbank(b):
-        let r = ctx.newTemp()
-        ctx.instrs.add "mov " & r & ", " & b
-        b = r
+        b = ctx.materialize(b)
       let t = ctx.newTemp()
-      ctx.instrs.add "add " & t & ", " & ctx.lower(n[1]) & ", -" & b
+      ctx.instrs.add "add " & t & ", " & ops[0] & ", -" & b
       return t
     else:
       fail("unsupported operator '" & op & "' in PICA200 shader", n)
@@ -331,6 +382,83 @@ proc lowerBody(ctx: var Ctx, body: NimNode) =
   ## nnkStmtList. Handle both.
   ctx.lowerStmt(body)
 
+# --- register allocation: virtual temps (vtN) -> physical r0..r15 -----------
+#
+# Straight-line code, so liveness is one linear pass: each virtual temp is live
+# from its first definition to its last use, and a physical register is reused
+# once its temp dies. The PICA200 has 16 temp registers and NO spilling — if
+# more than 16 are ever simultaneously live the shader cannot run, so we reject
+# it at Nim-compile time rather than emit something the hardware can't execute.
+
+const PicaTempRegs = 16
+
+proc tempBase(operand: string): string =
+  ## The "vtN" base of an operand, or "" if it is not a virtual temp.
+  var s = operand
+  if s.len > 0 and s[0] == '-': s = s[1 .. ^1]
+  let cut = s.find({'.', '['})
+  let b = if cut < 0: s else: s[0 ..< cut]
+  if b.len > 2 and b[0] == 'v' and b[1] == 't' and
+     b[2 .. ^1].allCharsInSet({'0'..'9'}): b
+  else: ""
+
+proc splitInstr(line: string): tuple[op: string, operands: seq[string]] =
+  let sp = line.find(' ')
+  if sp < 0: return (line, @[])
+  result.op = line[0 ..< sp]
+  for part in line[sp+1 .. ^1].split(", "):
+    result.operands.add part
+
+proc rewriteOperand(operand: string, pregOf: Table[string, int]): string =
+  var sign = ""
+  var s = operand
+  if s.len > 0 and s[0] == '-': (sign = "-"; s = s[1 .. ^1])
+  let cut = s.find({'.', '['})
+  let base = if cut < 0: s else: s[0 ..< cut]
+  let rest = if cut < 0: "" else: s[cut .. ^1]
+  if base in pregOf: sign & "r" & $pregOf[base] & rest
+  else: operand
+
+proc allocateRegisters(ctx: var Ctx, errNode: NimNode) =
+  var parsed: seq[tuple[op: string, operands: seq[string]]]
+  var lastUse = initTable[string, int]()
+  for i, line in ctx.instrs:
+    let pi = splitInstr(line)
+    parsed.add pi
+    for o in pi.operands:
+      let b = tempBase(o)
+      if b.len > 0: lastUse[b] = i
+
+  var pregOf = initTable[string, int]()         # vt -> physical (permanent)
+  var occupant: array[PicaTempRegs, string]     # current vt per reg ("" = free)
+  for i, pi in parsed:
+    # Expire registers whose occupant's last use is strictly before this instr.
+    for r in 0 ..< PicaTempRegs:
+      if occupant[r].len > 0 and lastUse[occupant[r]] < i:
+        occupant[r] = ""
+    # Allocate the destination temp if newly defined.
+    if pi.operands.len > 0:
+      let d = tempBase(pi.operands[0])
+      if d.len > 0 and d notin pregOf:
+        var chosen = -1
+        for r in 0 ..< PicaTempRegs:
+          if occupant[r].len == 0: chosen = r; break
+        if chosen < 0:
+          fail("vertex shader needs more than " & $PicaTempRegs &
+               " temporary registers — the PICA200 has no register spilling; " &
+               "simplify or split the shader", errNode)
+        occupant[chosen] = d
+        pregOf[d] = chosen
+
+  for i in 0 ..< ctx.instrs.len:
+    var lineOut = parsed[i].op
+    if parsed[i].operands.len > 0:
+      var outOps: seq[string]
+      for o in parsed[i].operands:
+        outOps.add rewriteOperand(o, pregOf)
+      lineOut.add " " & outOps.join(", ")
+    ctx.instrs[i] = lineOut
+
 # --- assembly ---------------------------------------------------------------
 
 proc toPicaInner*(s: NimNode): string =
@@ -351,6 +479,7 @@ proc toPicaInner*(s: NimNode): string =
     fail("PICA200 vertex shader must declare a 'var Vec4' position output " &
          "(e.g. gl_Position)", impl)
   ctx.lowerBody(body)
+  ctx.allocateRegisters(impl)
 
   when defined(shadyPicaDebug):
     echo "--- PICA AST ---"
