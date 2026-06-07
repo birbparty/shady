@@ -1,6 +1,7 @@
 ## Shader macro, converts Nim code into shader source.
 
 import macros, strutils, tables, vmath
+import std/hashes
 import shady/backends/[glsl, glsl3, glsl4, dx12, metal4, vulkan]
 import shady/backends/pica200
 
@@ -1537,6 +1538,33 @@ macro toPica*(s: typed): string =
   ## Nintendo 3DS. Vertex stage only — the PICA200 has no programmable fragment
   ## stage (see backends/pica200.nim and the 3DS plan).
   newLit(toShaderInner(s, pica200Vsh, shaderVertex))
+
+macro toPicaShbin*(s: typed): string =
+  ## Like `toPica`, but assembles the shader with `picasso` at Nim-compile time
+  ## and returns the resulting `.shbin` *bytes* as a string const — so a 3DS
+  ## consumer can embed the binary inline (no separate `.v.pica`/`staticRead`).
+  ##
+  ## Requires `picasso` (devkitPro) on PATH at compile time; picasso is a host
+  ## tool and runs regardless of the compile target. Only invoked when you call
+  ## this macro, so non-3DS builds that never call it never need picasso. Errors
+  ## with picasso's diagnostics if assembly fails.
+  ##
+  ## Mechanics: picasso writes to a `-o <file>` (not stdout), so this writes the
+  ## `.v.pica` to a temp path, runs picasso, then reads the `.shbin` back.
+  let pica = toShaderInner(s, pica200Vsh, shaderVertex)
+  let base = "/tmp/shady_pica_" & s.strVal & "_" & $hash(pica)
+  let vpath = base & ".v.pica"
+  let opath = base & ".shbin"
+  # Write the .v.pica via a shell here-doc (the assembly never contains the
+  # delimiter token).
+  discard staticExec("cat > " & vpath & " <<'SHADYPICAEOF'\n" & pica &
+    "\nSHADYPICAEOF")
+  let asmOut = staticExec("picasso " & vpath & " -o " & opath &
+    " 2>&1 && echo SHADY_PICASSO_OK")
+  if "SHADY_PICASSO_OK" notin asmOut:
+    error("[Shady/PICA200] picasso failed to assemble the generated shader.\n" &
+      asmOut & "\n--- generated .v.pica ---\n" & pica, s)
+  newLit(staticRead(opath))
 
 ## GLSL helper functions
 
