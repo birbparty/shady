@@ -13,7 +13,7 @@
 ## assembly picasso would reject). The real liveness/16-register allocator and
 ## operand-bank materialization land in M3; M1 uses a naive temp counter.
 
-import std/[macros, strutils, tables]
+import std/[macros, strutils, tables, sets]
 
 type
   PicaError* = object of CatchableError
@@ -42,6 +42,8 @@ type
     constPool: Table[string, string]   ## "0.0,1.0,0.0,0.0" -> const name
     cReg: int                          ## next free c-register
     hasPosition: bool                  ## a position output was declared
+    cbankNames: HashSet[string]        ## base names that live in the c-bank
+                                       ## (uniforms + consts) — forbidden in src2
 
 proc fail(msg: string, n: NimNode) {.noreturn.} =
   error("[Shady/PICA200] " & msg, n)
@@ -58,14 +60,43 @@ proc constLane(ctx: var Ctx, x, y, z, w: float): string =
   if key notin ctx.constPool:
     let name = "shady_c" & $ctx.constPool.len
     ctx.constPool[key] = name
+    ctx.cbankNames.incl name
     ctx.decls.add ".constf " & name & "(" & key & ")"
   ctx.constPool[key]
 
 proc scalarConst(ctx: var Ctx, v: float): string =
-  ## A scalar constant — returns a single-lane operand ("name.x"). All lanes of
-  ## the pooled const hold `v`, so ".x" reads it; width is 1 for vec-ctor lanes.
-  let name = ctx.constLane(v, v, v, v)
-  name & ".x"
+  ## A scalar constant — returns the bare pooled-const name (no swizzle). All
+  ## four lanes hold `v`, so it reads correctly whether used as a full-width
+  ## broadcast (arithmetic) or a single dest lane in a vec constructor.
+  ctx.constLane(v, v, v, v)
+
+# --- operand-bank reachability (PICA: src2 may NOT be a c-bank register) -----
+
+proc baseToken(operand: string): string =
+  ## The leading register identifier of an operand, before any '.'/'[' / '-'.
+  var s = operand
+  if s.len > 0 and s[0] == '-': s = s[1 .. ^1]
+  let cut = s.find({'.', '['})
+  if cut < 0: s else: s[0 ..< cut]
+
+proc isCbank(ctx: Ctx, operand: string): bool =
+  baseToken(operand) in ctx.cbankNames
+
+proc emitBinary(ctx: var Ctx, op, a, b: string, commutative: bool): string =
+  ## Emit `op dst, src1, src2` honoring the rule that src2 cannot be c-bank.
+  ## Returns the destination temp.
+  var sa = a
+  var sb = b
+  if ctx.isCbank(sb):
+    if commutative and not ctx.isCbank(sa):
+      swap sa, sb                      # move the c-bank operand into src1
+    else:
+      let r = ctx.newTemp()            # materialize the c-bank operand
+      ctx.instrs.add "mov " & r & ", " & sb
+      sb = r
+  let t = ctx.newTemp()
+  ctx.instrs.add op & " " & t & ", " & sa & ", " & sb
+  t
 
 # --- type classification (syntactic, alias-aware) ---------------------------
 
@@ -79,10 +110,13 @@ proc uniformInner(typeNode: NimNode): string =
   typeNode[1].repr   # "Mat4" / "Vec4" / GMat4[float32] etc.
 
 proc semanticForOutput(name: string): OutputSemantic =
+  ## Choose a PICA output semantic from the param name. Order matters: check
+  ## "col" before the texcoord tokens so "ouTColor" isn't misread as a texcoord
+  ## (it contains the substring "tc"). Keep tokens specific for the same reason.
   let n = name.toLowerAscii
   if n == "gl_position" or "pos" in n: semPosition
-  elif "uv" in n or "tc" in n or "texcoord" in n or "tex" in n: semTexcoord0
   elif "col" in n: semColor
+  elif "uv" in n or "texcoord" in n or "uv1" in n: semTexcoord0
   else: semTexcoord0
 
 # --- gather pass (formal params only for M1) --------------------------------
@@ -103,6 +137,11 @@ proc gather(ctx: var Ctx, formalParams: NimNode) =
           of semTexcoord0: "outtc0"
           of semTexcoord1: "outtc1"
           of semColor: "outclr"
+        for existing in ctx.outputs.values:
+          if existing.reg == reg:
+            fail("two outputs map to the same PICA register '" & reg & "' (" &
+                 $sem & "); rename one so its semantic differs " &
+                 "(position/texcoord0/color)", identDefs)
         ctx.outputs[name] = OutBinding(reg: reg, semantic: sem)
         ctx.decls.add ".out " & reg & " " & $sem
         if sem == semPosition: ctx.hasPosition = true
@@ -110,10 +149,12 @@ proc gather(ctx: var Ctx, formalParams: NimNode) =
         let inner = uniformInner(typeNode)
         if "Mat4" in inner:
           ctx.uniforms[name] = UniformInfo(base: ctx.cReg, size: 4)
+          ctx.cbankNames.incl name
           ctx.decls.add ".fvec " & name & "[4]"
           ctx.cReg += 4
         elif "Vec4" in inner or "Vec3" in inner or "Vec2" in inner:
           ctx.uniforms[name] = UniformInfo(base: ctx.cReg, size: 1)
+          ctx.cbankNames.incl name
           ctx.decls.add ".fvec " & name
           ctx.cReg += 1
         else:
@@ -203,34 +244,38 @@ proc lower(ctx: var Ctx, n: NimNode): string =
     if fn in ["vec2", "vec3", "vec4"]:
       return ctx.lowerVecCtor(n)
     if fn in ["min", "max"] and n.len == 3:
-      let a = ctx.lower(n[1])
-      let b = ctx.lower(n[2])
-      let t = ctx.newTemp()
-      ctx.instrs.add fn & " " & t & ", " & a & ", " & b
-      return t
+      return ctx.emitBinary(fn, ctx.lower(n[1]), ctx.lower(n[2]),
+        commutative = true)
     if fn in ["dot"] and n.len == 3:
-      let a = ctx.lower(n[1])
-      let b = ctx.lower(n[2])
-      let t = ctx.newTemp()
-      ctx.instrs.add "dp4 " & t & ".x, " & a & ", " & b
+      # dp4 writes a scalar; result is its .x lane.
+      let t = ctx.emitBinary("dp4", ctx.lower(n[1]), ctx.lower(n[2]),
+        commutative = true)
       return t & ".x"
     fail("unsupported call in PICA200 shader: " & fn, n)
   of nnkInfix:
     let op = n[0].strVal
-    let a = n[1]
-    let b = n[2]
-    let t = ctx.newTemp()
     case op
     of "+":
-      ctx.instrs.add "add " & t & ", " & ctx.lower(a) & ", " & ctx.lower(b)
-    of "-":
-      # PICA negates the src2 via operand modifier; M1 emits add with -src2.
-      ctx.instrs.add "add " & t & ", " & ctx.lower(a) & ", -" & ctx.lower(b)
+      return ctx.emitBinary("add", ctx.lower(n[1]), ctx.lower(n[2]),
+        commutative = true)
     of "*":
-      ctx.instrs.add "mul " & t & ", " & ctx.lower(a) & ", " & ctx.lower(b)
+      return ctx.emitBinary("mul", ctx.lower(n[1]), ctx.lower(n[2]),
+        commutative = true)
+    of "-":
+      # a - b  ->  add a, -b. Negation is an src2 modifier, so b must first be
+      # reachable in src2 (not c-bank): materialize it if needed via emitBinary's
+      # rule, then negate. Simplest correct form: compute b into a temp when it
+      # is c-bank, else negate in place.
+      var b = ctx.lower(n[2])
+      if ctx.isCbank(b):
+        let r = ctx.newTemp()
+        ctx.instrs.add "mov " & r & ", " & b
+        b = r
+      let t = ctx.newTemp()
+      ctx.instrs.add "add " & t & ", " & ctx.lower(n[1]) & ", -" & b
+      return t
     else:
       fail("unsupported operator '" & op & "' in PICA200 shader", n)
-    return t
   of nnkHiddenStdConv, nnkConv, nnkHiddenDeref, nnkHiddenAddr:
     return ctx.lower(n[^1])
   of nnkStmtListExpr:
