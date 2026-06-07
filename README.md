@@ -107,6 +107,27 @@ Output:
 * Integer vertex attributes (e.g. `GPU_UNSIGNED_BYTE` colors) arrive
   **un-normalized**; divide by 255 in the shader if you need `[0,1]`.
 
+## Fragments on the 3DS: there is no programmable fragment stage
+
+The PICA200 has **no programmable fragment shader** — per-pixel color comes from
+up to six fixed-function **TEV** (texture-environment combiner) stages configured
+on the CPU via citro3d. Shady can't compile an arbitrary fragment shader for it.
+What it *can* do is recognize the handful of shapes 2D rendering needs and emit a
+fixed-function TEV descriptor with `toTev`:
+
+```nim
+proc modulateFrag(fragColor: var Vec4, texColor: Vec4, vertColor: Vec4) =
+  fragColor = texColor * vertColor          # texture x vertex color
+
+const stage = toTev(modulateFrag)
+# stage.fn == tevModulate; stage.src0 == tevTexture0; stage.src1 == tevPrimaryColor
+# stage.fn.gpuFunc == "GPU_MODULATE"  (map to citro3d C3D_TexEnv* on the host)
+```
+
+Recognized: `Replace` (texture only), `Modulate` (texture × color), `Add`.
+**Everything else hard-errors** ("the 3DS has no programmable fragment stage") —
+`toTev` is a recognizer for a few fixed-function configurations, not a compiler.
+
 Building Shady-consuming code for the 3DS (cross-compiled with devkitARM) should
 pass **`-d:shadyNoPixie`** so the CPU-simulation runtime (which needs `pixie`) is
 not compiled into the ARM binary — the shader codegen itself needs no pixie.
