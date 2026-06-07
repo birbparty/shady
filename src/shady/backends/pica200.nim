@@ -383,16 +383,88 @@ proc lowerAssign(ctx: var Ctx, lhs, rhs: NimNode) =
   let src = ctx.lower(rhs)
   ctx.instrs.add "mov " & dst & ", " & src
 
+proc lowerStmt(ctx: var Ctx, stmt: NimNode)   # forward (mutual recursion)
+
+# --- control flow: if/else -> cmp + ifc/.else/.end --------------------------
+
+proc picaCmpOp(nimOp: string, n: NimNode): string =
+  case nimOp
+  of "<": "lt"
+  of ">": "gt"
+  of "<=": "le"
+  of ">=": "ge"
+  of "==": "eq"
+  of "!=": "ne"
+  else:
+    fail("unsupported comparison '" & nimOp & "' in a PICA200 if-condition " &
+         "(use < > <= >= == !=)", n)
+
+proc invertCmpOp(op: string): string =
+  ## Comparison with operands swapped: a<b == b>a, etc. (eq/ne are symmetric).
+  case op
+  of "lt": "gt"
+  of "gt": "lt"
+  of "le": "ge"
+  of "ge": "le"
+  else: op
+
+proc emitCmp(ctx: var Ctx, cond: NimNode): string =
+  ## Emit a `cmp` for a comparison; return the condition operand ("cmp.x").
+  # The condition may be wrapped (a `>`/`>=` desugars to a flipped `<`/`<=`
+  # inside a StmtListExpr).
+  var c = cond
+  while c.kind in {nnkStmtListExpr, nnkStmtList, nnkHiddenStdConv, nnkConv, nnkPar}:
+    c = c[^1]
+  if c.kind != nnkInfix:
+    fail("a PICA200 'if' condition must be a comparison (a < b, a == b, ...)", cond)
+  var op = picaCmpOp(c[0].strVal, c)
+  var ops = @[ctx.lower(c[1]), ctx.lower(c[2])]
+  ctx.capReadPorts(ops)               # <=1 input + <=1 c-bank per instruction
+  var a = ops[0]
+  var b = ops[1]
+  if ctx.isCbank(b):                  # cmp src2 may not be c-bank; cmp isn't
+    swap a, b                         # commutative, so swap operands AND invert
+    op = invertCmpOp(op)
+    if ctx.isCbank(b): b = ctx.materialize(b)
+  # opx and opy both set; we read cmp.x.
+  ctx.instrs.add "cmp " & a & ", " & op & ", " & op & ", " & b
+  "cmp.x"
+
+proc lowerIfBranch(ctx: var Ctx, n: NimNode, idx: int) =
+  ## Emit branch `idx` of an nnkIfStmt (if / elif* / else) as nested
+  ## cmp + ifc/.else/.end. (Top-level proc — a nested closure can't capture
+  ## the `var Ctx`.)
+  let br = n[idx]
+  case br.kind
+  of nnkElifBranch:
+    let cond = ctx.emitCmp(br[0])
+    ctx.instrs.add "ifc " & cond
+    ctx.lowerStmt(br[1])
+    if idx + 1 < n.len:
+      ctx.instrs.add ".else"
+      ctx.lowerIfBranch(n, idx + 1)
+    ctx.instrs.add ".end"
+  of nnkElse:
+    ctx.lowerStmt(br[0])
+  else:
+    fail("unsupported if branch " & $br.kind, br)
+
+proc lowerIf(ctx: var Ctx, n: NimNode) =
+  ## n is nnkIfStmt: if / elif* / else. Lowers to nested cmp + ifc/.else/.end.
+  ctx.lowerIfBranch(n, 0)
+
 proc lowerStmt(ctx: var Ctx, stmt: NimNode) =
   case stmt.kind
   of nnkAsgn:
     ctx.lowerAssign(stmt[0], stmt[1])
+  of nnkIfStmt:
+    ctx.lowerIf(stmt)
   of nnkCommentStmt, nnkEmpty, nnkDiscardStmt:
     discard
   of nnkStmtList, nnkStmtListExpr:
     for s in stmt: ctx.lowerStmt(s)
   of nnkVarSection, nnkLetSection:
-    fail("local variables are not yet supported in PICA200 (M1)", stmt)
+    fail("local variables are not yet supported in PICA200", stmt)
   else:
     fail("unsupported statement " & $stmt.kind & " in PICA200 shader", stmt)
 
@@ -455,8 +527,11 @@ proc allocateRegisters(ctx: var Ctx, errNode: NimNode) =
     for r in 0 ..< PicaTempRegs:
       if occupant[r].len > 0 and lastUse[occupant[r]] < i:
         occupant[r] = ""
-    # Allocate the destination temp if newly defined.
-    if pi.operands.len > 0:
+    # Allocate the destination temp if newly defined. Control-flow ops read (or
+    # don't touch) their first operand — they never define a temp there.
+    let writesDest = pi.op notin ["cmp", "ifc", "for", "nop", "end"] and
+                     not pi.op.startsWith(".")
+    if writesDest and pi.operands.len > 0:
       let d = tempBase(pi.operands[0])
       if d.len > 0 and d notin pregOf:
         var chosen = -1

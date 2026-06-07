@@ -160,6 +160,36 @@ block vec3Dot:
   doAssert "dp4 outpos.x, mvp[0], r" in dotShader, dotShader
   doAssert assembles("dot", dotShader)
 
+# --- shape 5: if/else control flow -> cmp + ifc/.else/.end ------------------
+
+proc branchVert(
+  gl_Position: var Vec4,
+  projection: Uniform[Mat4],
+  threshold: Uniform[Vec4],
+  inPos: Vec2,
+  inUv: Vec2,
+  inColor: Vec4,
+  outUv: var Vec2,
+  outColor: var Vec4
+) =
+  gl_Position = projection * vec4(inPos.x, inPos.y, 0.0, 1.0)
+  outUv = inUv
+  if inPos.x > threshold.x:
+    outColor = inColor
+  else:
+    outColor = inColor * vec4(0.3, 0.3, 0.3, 1.0)
+
+const branchShader = toPica(branchVert)
+
+block ifElse:
+  # inPos.x > threshold.x desugars to threshold.x < inPos.x; the const/uniform
+  # must sit in cmp's src1 (src2 can't be c-bank), so the op is the flipped lt.
+  doAssert "cmp threshold.x, lt, lt, v0.x" in branchShader, branchShader
+  doAssert "ifc cmp.x" in branchShader, branchShader
+  doAssert ".else" in branchShader, branchShader
+  doAssert ".end" in branchShader, branchShader
+  doAssert assembles("branch", branchShader)
+
 # --- fail-loud: a shader with no position output is rejected -----------------
 
 block failLoud:
