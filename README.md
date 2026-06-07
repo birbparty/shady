@@ -70,6 +70,10 @@ proc basicVert(
 const picaSource = toPica(basicVert)
 # Assemble with devkitPro's picasso, then load the .shbin via libctru/citro3d:
 #   picasso basicVert.v.pica -o basicVert.shbin
+
+# Or skip the file entirely — assemble with picasso at compile time and embed
+# the .shbin bytes inline (requires picasso on PATH; only runs when you call it):
+const shbinBytes = toPicaShbin(basicVert)   # ready for DVLB_ParseFile
 ```
 
 Output:
