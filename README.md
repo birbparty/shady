@@ -105,9 +105,12 @@ Output:
   (`v0`, `v1`, …, in declaration order); a `Uniform[Mat4]`/`Uniform[Vec4]` param
   becomes a `.fvec` uniform (resolved by name on the host); a `var` output maps
   to a PICA output semantic (`position`/`texcoord0`/`color`) chosen by name.
-* **Straight-line code only (current scope).** Control flow, geometry shaders,
-  and shaders needing more than the 16 temp registers are rejected with a clear
-  compile error (the PICA200 has no register spilling).
+* **Supported:** straight-line transforms, `if`/`elif`/`else` (→ `cmp` + `ifc`),
+  local `let`/`var` (incl. mutable accumulation), and `for` loops with
+  **constant** bounds (unrolled). Shaders needing more than the 16 temp registers
+  are rejected with a clear compile error (the PICA200 has no register spilling).
+* **Not yet:** uniform-bounded (`.ivec`) hardware loops and **geometry shaders**
+  (a separate picasso `.gsh` pipeline) — these hard-error for now.
 * Integer vertex attributes (e.g. `GPU_UNSIGNED_BYTE` colors) arrive
   **un-normalized**; divide by 255 in the shader if you need `[0,1]`.
 
