@@ -214,6 +214,16 @@ proc swizzleOf(field: string): string =
 
 proc lower(ctx: var Ctx, n: NimNode): string
 
+proc vecWidth(n: NimNode): int =
+  ## Component count of a vector-typed node (2/3/4), or 0 if not determinable.
+  let t =
+    try: n.getTypeInst().repr
+    except CatchableError: ""
+  if "Vec4" in t or "GVec4" in t: 4
+  elif "Vec3" in t or "GVec3" in t: 3
+  elif "Vec2" in t or "GVec2" in t: 2
+  else: 0
+
 proc lowerVecCtor(ctx: var Ctx, n: NimNode): string =
   ## vec2/vec3/vec4(...) -> build into a fresh temp, return it.
   let t = ctx.newTemp()
@@ -279,8 +289,17 @@ proc lower(ctx: var Ctx, n: NimNode): string =
       return ctx.emitBinary(fn, ctx.lower(n[1]), ctx.lower(n[2]),
         commutative = true)
     if fn in ["dot"] and n.len == 3:
-      # dp4 writes a scalar; result is its .x lane.
-      let t = ctx.emitBinary("dp4", ctx.lower(n[1]), ctx.lower(n[2]),
+      # Pick dp3/dp4 by operand width — dp4 on a Vec3 would add the padded w
+      # lane and silently corrupt the result.
+      let w = max(vecWidth(n[1]), vecWidth(n[2]))
+      let dp =
+        case w
+        of 4: "dp4"
+        of 3: "dp3"
+        else: fail("dot() on PICA200 requires Vec3 or Vec4 operands (got " &
+                   "width " & $w & ")", n)
+      # dp3/dp4 write a scalar; result is its .x lane.
+      let t = ctx.emitBinary(dp, ctx.lower(n[1]), ctx.lower(n[2]),
         commutative = true)
       return t & ".x"
     fail("unsupported call in PICA200 shader: " & fn, n)

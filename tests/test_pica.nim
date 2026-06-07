@@ -138,6 +138,28 @@ block overBudget:
   doAssert not compiles(toPica(tooManyTemps)),
     "toPica should reject a shader exceeding 16 temp registers (no spilling)"
 
+# --- shape 4: Vec3 dot must use dp3, not dp4 --------------------------------
+
+proc dotVert(
+  gl_Position: var Vec4,
+  mvp: Uniform[Mat4],
+  inPos: Vec3,
+  inNormal: Vec3,
+  inColor: Vec4,
+  outColor: var Vec4
+) =
+  gl_Position = mvp * vec4(inPos.x, inPos.y, inPos.z, 1.0)
+  outColor = inColor * dot(inNormal, inNormal)
+
+const dotShader = toPica(dotVert)
+
+block vec3Dot:
+  # A Vec3 dot must be dp3 — dp4 would add the padded w lane and corrupt it.
+  doAssert "dp3 " in dotShader, dotShader
+  # The transform still uses dp4 (Vec4).
+  doAssert "dp4 outpos.x, mvp[0], r" in dotShader, dotShader
+  doAssert assembles("dot", dotShader)
+
 # --- fail-loud: a shader with no position output is rejected -----------------
 
 block failLoud:
