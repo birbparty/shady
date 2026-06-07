@@ -190,6 +190,42 @@ block ifElse:
   doAssert ".end" in branchShader, branchShader
   doAssert assembles("branch", branchShader)
 
+# --- shape 6: local variables + unrolled for-loop ---------------------------
+
+proc loopVert(
+  gl_Position: var Vec4,
+  projection: Uniform[Mat4],
+  inPos: Vec2,
+  inColor: Vec4,
+  outColor: var Vec4
+) =
+  gl_Position = projection * vec4(inPos.x, inPos.y, 0.0, 1.0)
+  var acc = inColor
+  for i in 0 ..< 3:
+    acc = acc * vec4(0.5, 0.5, 0.5, 1.0)
+  outColor = acc
+
+const loopShader = toPica(loopVert)
+
+block localsAndLoop:
+  # The loop unrolls to three mul accumulations into the local's stable register.
+  doAssert loopShader.count("mul ") == 3, loopShader
+  doAssert assembles("loop", loopShader)
+
+block constBoundRequired:
+  # A non-constant (uniform-bounded) loop count can't be unrolled — reject it.
+  proc dynLoop(
+    gl_Position: var Vec4, projection: Uniform[Mat4], count: Uniform[int],
+    inPos: Vec2, inColor: Vec4, outColor: var Vec4
+  ) =
+    gl_Position = projection * vec4(inPos.x, inPos.y, 0.0, 1.0)
+    var acc = inColor
+    for i in 0 ..< count:
+      acc = acc * vec4(0.5, 0.5, 0.5, 1.0)
+    outColor = acc
+  doAssert not compiles(toPica(dynLoop)),
+    "toPica must reject a for-loop with a non-constant bound"
+
 # --- fail-loud: a shader with no position output is rejected -----------------
 
 block failLoud:

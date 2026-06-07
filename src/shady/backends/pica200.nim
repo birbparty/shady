@@ -44,6 +44,8 @@ type
     hasPosition: bool                  ## a position output was declared
     cbankNames: HashSet[string]        ## base names that live in the c-bank
                                        ## (uniforms + consts) — forbidden in src2
+    locals: Table[string, string]      ## local var/let name -> temp register
+    loopConsts: Table[string, int]     ## unrolled for-loop var -> current value
 
 proc fail(msg: string, n: NimNode) {.noreturn.} =
   error("[Shady/PICA200] " & msg, n)
@@ -251,6 +253,8 @@ proc lower(ctx: var Ctx, n: NimNode): string =
   case n.kind
   of nnkSym, nnkIdent:
     let name = n.strVal
+    if name in ctx.loopConsts: return ctx.scalarConst(ctx.loopConsts[name].float)
+    if name in ctx.locals: return ctx.locals[name]
     if name in ctx.inputs: return ctx.inputs[name]
     if name in ctx.uniforms: return name   # mat/vec uniform base name
     fail("unknown identifier in PICA200 shader: " & name, n)
@@ -367,8 +371,15 @@ proc lowerAssign(ctx: var Ctx, lhs, rhs: NimNode) =
   if lnode.kind notin {nnkSym, nnkIdent}:
     fail("unsupported assignment target " & $lnode.kind, lhs)
   let lname = lnode.strVal
+
+  # Reassigning a mutable local: mov the value into the local's stable temp.
+  if lname in ctx.locals:
+    let src = ctx.lower(rhs)
+    ctx.instrs.add "mov " & ctx.locals[lname] & ", " & src
+    return
+
   if lname notin ctx.outputs:
-    fail("assignment target is not a declared output: " & lname, lhs)
+    fail("assignment target is not a declared output or local: " & lname, lhs)
   let dst = ctx.outputs[lname].reg
 
   # Special case: out = mat4 * vec4  ->  four dp4 directly into the output.
@@ -453,18 +464,66 @@ proc lowerIf(ctx: var Ctx, n: NimNode) =
   ## n is nnkIfStmt: if / elif* / else. Lowers to nested cmp + ifc/.else/.end.
   ctx.lowerIfBranch(n, 0)
 
+# --- locals and (unrolled) for loops ----------------------------------------
+
+proc lowerLocalSection(ctx: var Ctx, sec: NimNode) =
+  ## `let`/`var x = expr` — back each local with a stable temp (so a `var` can be
+  ## reassigned, e.g. accumulated in a loop).
+  for idef in sec:
+    if idef.kind != nnkIdentDefs: continue
+    let valNode = idef[^1]
+    if valNode.kind == nnkEmpty:
+      fail("a PICA200 local must be initialized (var x = ...)", idef)
+    let val = ctx.lower(valNode)
+    for i in 0 ..< idef.len - 2:
+      let t = ctx.newTemp()
+      ctx.instrs.add "mov " & t & ", " & val
+      ctx.locals[idef[i].strVal] = t
+
+proc constInt(n: NimNode): int =
+  var x = n
+  while x.kind in {nnkHiddenStdConv, nnkConv, nnkChckRange, nnkPar, nnkStmtListExpr}:
+    x = x[^1]
+  if x.kind in {nnkIntLit .. nnkInt64Lit}: x.intVal.int
+  else: fail("a PICA200 for-loop bound must be a compile-time integer", n)
+
+proc lowerFor(ctx: var Ctx, n: NimNode) =
+  ## `for i in a ..< b` / `a .. b` with constant bounds — unrolled (the body runs
+  ## once per index, with `i` available as a constant). The PICA200 also has a
+  ## hardware `for`/loop register, but that needs an `.ivec` uniform set by the
+  ## host; unrolling is self-contained and needs no host support.
+  let loopVar = n[0]
+  if loopVar.kind notin {nnkSym, nnkIdent}:
+    fail("a PICA200 for-loop variable must be a simple name", n)
+  let r = n[1]
+  if r.kind notin {nnkInfix, nnkCall, nnkCommand} or r.len != 3 or
+     r[0].repr notin ["..", "..<"]:
+    fail("a PICA200 for-loop needs a constant integer range (for i in a ..< b)", n)
+  let lo = constInt(r[1])
+  let last = (if r[0].repr == "..": constInt(r[2]) else: constInt(r[2]) - 1)
+  if last - lo + 1 > 256:
+    fail("PICA200 for-loop unrolls to more than 256 iterations — too large " &
+         "(the instruction budget is ~512)", n)
+  let name = loopVar.strVal
+  for k in lo .. last:
+    ctx.loopConsts[name] = k
+    ctx.lowerStmt(n[2])
+  ctx.loopConsts.del(name)
+
 proc lowerStmt(ctx: var Ctx, stmt: NimNode) =
   case stmt.kind
   of nnkAsgn:
     ctx.lowerAssign(stmt[0], stmt[1])
   of nnkIfStmt:
     ctx.lowerIf(stmt)
+  of nnkForStmt:
+    ctx.lowerFor(stmt)
+  of nnkVarSection, nnkLetSection:
+    ctx.lowerLocalSection(stmt)
   of nnkCommentStmt, nnkEmpty, nnkDiscardStmt:
     discard
   of nnkStmtList, nnkStmtListExpr:
     for s in stmt: ctx.lowerStmt(s)
-  of nnkVarSection, nnkLetSection:
-    fail("local variables are not yet supported in PICA200", stmt)
   else:
     fail("unsupported statement " & $stmt.kind & " in PICA200 shader", stmt)
 
