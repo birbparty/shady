@@ -2,6 +2,7 @@
 
 import macros, strutils, tables, vmath
 import shady/backends/[glsl, glsl3, glsl4, dx12, metal4, vulkan]
+import shady/backends/pica200
 
 type
   ShaderTarget* = enum
@@ -11,6 +12,9 @@ type
     vulkanGlsl450 ## GLSL 4.50 source shaped for Vulkan/SPIR-V.
     hlslDX12      ## HLSL for DirectX 12.
     metalMSL      ## Metal Shading Language.
+    pica200Vsh    ## PICA200 vertex shader (Nintendo 3DS), picasso assembly.
+                  ## NOT a C-family target: handled by a separate driver
+                  ## (toPicaInner), never through language()/toCode.
 
   GlslTarget* = ShaderTarget
 
@@ -52,6 +56,11 @@ proc language(target: ShaderTarget): ShaderLanguage =
     langHlsl
   of metalMSL:
     langMetal
+  of pica200Vsh:
+    # PICA200 has no C-family ShaderLanguage; it is handled by toPicaInner and
+    # must never reach language(). Branch present only for case exhaustiveness.
+    raise newException(ValueError,
+      "pica200Vsh has no ShaderLanguage; handled by toPicaInner")
 
 proc isGlsl(): bool =
   shaderTarget.language == langGlsl
@@ -1454,6 +1463,8 @@ proc toGLSLInner*(s: NimNode, target: GlslTarget): string =
     toGLSLInner(s, "", "")
   of metalMSL:
     toGLSLInner(s, "", "")
+  of pica200Vsh:
+    error("[Shady] toGLSL does not support pica200Vsh; use toPica / toShader", s)
 
 proc toShaderInner*(
   s: NimNode,
@@ -1461,6 +1472,10 @@ proc toShaderInner*(
   stage = shaderAuto
 ): string =
   ## Converts proc to shader source for the given target.
+  # PICA200 is a register machine, not a C-family language — intercept it BEFORE
+  # touching shaderTarget/language()/toGLSLInner (see backends/pica200.nim).
+  if target == pica200Vsh:
+    return toPicaInner(s)
   shaderTarget = target
   shaderStage = stage
   case target
@@ -1474,6 +1489,8 @@ proc toShaderInner*(
     toGLSLInner(s, glsl3WebGLVersion, glsl3WebGLExtra)
   of hlslDX12, metalMSL:
     toGLSLInner(s, "", "")
+  of pica200Vsh:
+    toPicaInner(s)   # unreachable (handled above); keeps the case exhaustive
 
 macro toGLSL*(
   s: typed,
@@ -1514,6 +1531,12 @@ macro toMSL*(
 ): string =
   ## Converts proc to Metal Shading Language source.
   newLit(toShaderInner(s, metalMSL, stage))
+
+macro toPica*(s: typed): string =
+  ## Converts a vertex-shader proc to PICA200 picasso (.v.pica) assembly for the
+  ## Nintendo 3DS. Vertex stage only — the PICA200 has no programmable fragment
+  ## stage (see backends/pica200.nim and the 3DS plan).
+  newLit(toShaderInner(s, pica200Vsh, shaderVertex))
 
 ## GLSL helper functions
 
