@@ -109,8 +109,42 @@ Output:
   local `let`/`var` (incl. mutable accumulation), and `for` loops with
   **constant** bounds (unrolled). Shaders needing more than the 16 temp registers
   are rejected with a clear compile error (the PICA200 has no register spilling).
-* **Not yet:** uniform-bounded (`.ivec`) hardware loops and **geometry shaders**
-  (a separate picasso `.gsh` pipeline) — these hard-error for now.
+* **Geometry shaders** are supported via `toGeoPica` (see below).
+* **Not yet:** uniform-bounded (`.ivec`) hardware loops — these hard-error for now.
+
+## Geometry shaders (`toGeoPica`)
+
+The PICA200 also has a programmable **geometry** stage. `toGeoPica` compiles a
+Nim proc that takes a `Primitive[N, T]` input and emits output vertices with
+`emitVertex`/`endPrimitive` to picasso `.g.pica` assembly:
+
+```nim
+type GeoVertex = object   # fields mirror the pass-through vertex shader's outputs
+  position: Vec4
+  color: Vec4
+
+# Subdivide each input triangle into three (midpoint subdivision).
+proc subdivideGeo(prim: Primitive[3, GeoVertex], projection: Uniform[Mat4]) =
+  let m0 = (prim[0].position + prim[1].position) * 0.5
+  let m1 = (prim[1].position + prim[2].position) * 0.5
+  let m2 = (prim[2].position + prim[0].position) * 0.5
+  emitVertex(projection * prim[0].position, prim[0].color)
+  emitVertex(projection * m0, prim[1].color)
+  emitVertex(projection * m2, prim[2].color)
+  endPrimitive()
+  # ... two more triangles ...
+
+const geoSource = toGeoPica(subdivideGeo)
+```
+
+A geometry program is **one shbin with two DVLEs** — a pass-through vertex shader
+(`DVLE[0]`) and the geometry shader (`DVLE[1]`) — assembled together in one
+picasso call (`picasso pass.v.pica geo.g.pica -o out.shbin`) and loaded with
+`shaderProgramSetGsh(dvle1, stride)`. The host stride = (vsh output registers) ×
+(vertices per primitive). v1 targets the devkitPro `geoshader` example's shape
+(`GSH_POINT`, 3-vertex triangles, ≤3 emits per output primitive); other modes
+hard-error. This was verified by reproducing that example's shader from Nim and
+assembling it into the example unchanged.
 * Integer vertex attributes (e.g. `GPU_UNSIGNED_BYTE` colors) arrive
   **un-normalized**; divide by 255 in the shader if you need `[0,1]`.
 
