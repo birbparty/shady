@@ -26,9 +26,11 @@ Current shader targets:
 * GLSL ES 3.0 via `glsl3WebGL` / `glslES3` for OpenGL ES 3.0 / WebGL 2.0.
 * HLSL via `hlslDX12` for DirectX 12.
 * Metal Shading Language via `metalMSL`.
+* PICA200 vertex assembly via `pica200Vsh` for the Nintendo 3DS (experimental —
+  vertex shaders only; see "Nintendo 3DS / PICA200" below).
 
 Use `toShader(shaderProc, target, stage)` for the general backend switch, or
-`toGLSL`, `toHLSL`, and `toMSL` for language-specific helpers.
+`toGLSL`, `toHLSL`, `toMSL`, and `toPica` for language-specific helpers.
 
 Runtime backend tests are separate so platform graphics dependencies stay
 optional:
@@ -46,6 +48,68 @@ Shady uses:
 * `vmath` library for vector and matrix operations.
 * `chroma` library for color conversions and operations.
 * `bumpy` library for collisions and intersections.
+
+# Nintendo 3DS / PICA200 (experimental)
+
+Shady can compile a **vertex** shader proc to [PICA200](https://www.3dbrew.org/wiki/GPU)
+picasso assembly (`.v.pica`) for the Nintendo 3DS via `toPica`:
+
+```nim
+import shady, vmath
+
+proc basicVert(
+  gl_Position: var Vec4,
+  projection: Uniform[Mat4],
+  vPos: Vec3
+) =
+  gl_Position = projection * vec4(vPos.x, vPos.y, vPos.z, 1.0)
+
+const picaSource = toPica(basicVert)
+# Assemble with devkitPro's picasso, then load the .shbin via libctru/citro3d:
+#   picasso basicVert.v.pica -o basicVert.shbin
+```
+
+Output:
+
+```
+.fvec projection[4]
+.out outpos position
+.alias vPos v0
+
+.proc main
+	mov r0.x, v0.x
+	mov r0.y, v0.y
+	mov r0.z, v0.z
+	mov r0.w, shady_c0.x
+	dp4 outpos.x, projection[0], r0
+	dp4 outpos.y, projection[1], r0
+	dp4 outpos.z, projection[2], r0
+	dp4 outpos.w, projection[3], r0
+	end
+.end
+```
+
+**Important hardware constraints** (these are PICA200 facts, not Shady choices):
+
+* **Vertex shaders only.** The PICA200 has **no programmable fragment stage** —
+  per-pixel color comes from the fixed-function TEV combiners, configured on the
+  CPU via citro3d. `toPica` rejects fragment shaders at compile time.
+* **Param conventions.** Plain vector/float params become vertex attributes
+  (`v0`, `v1`, …, in declaration order); a `Uniform[Mat4]`/`Uniform[Vec4]` param
+  becomes a `.fvec` uniform (resolved by name on the host); a `var` output maps
+  to a PICA output semantic (`position`/`texcoord0`/`color`) chosen by name.
+* **Straight-line code only (current scope).** Control flow, geometry shaders,
+  and shaders needing more than the 16 temp registers are rejected with a clear
+  compile error (the PICA200 has no register spilling).
+* Integer vertex attributes (e.g. `GPU_UNSIGNED_BYTE` colors) arrive
+  **un-normalized**; divide by 255 in the shader if you need `[0,1]`.
+
+Building Shady-consuming code for the 3DS (cross-compiled with devkitARM) should
+pass **`-d:shadyNoPixie`** so the CPU-simulation runtime (which needs `pixie`) is
+not compiled into the ARM binary — the shader codegen itself needs no pixie.
+
+`tests/test_pica.nim` exercises `toPica` and, when `picasso` is on `PATH`, checks
+that the generated assembly actually assembles.
 
 # Using Shady shader toy playground:
 
