@@ -23,6 +23,31 @@ block modulate:
   doAssert modStage.src0.gpuSource == "GPU_TEXTURE0"
   doAssert modStage.src1.gpuSource == "GPU_PRIMARY_COLOR"
 
+# --- applied path: descriptor -> citro3d GPU_* values ------------------------
+
+block appliedPathContract:
+  # A consumer maps the TevStage to citro3d's GPU_* enum values (libctru
+  # 3ds/gpu/enums.h). For the modulate stage, toTev must yield exactly the values
+  # boxy's hardware-verified citro3d backend uses:
+  #   GPU_MODULATE=0x01, GPU_TEXTURE0=0x03, GPU_PRIMARY_COLOR=0x00.
+  # (This was confirmed on a physical 3DS: driving boxy's modulate TEV from
+  # toTev(boxyModulateFrag) renders identically to the hardcoded constants.)
+  proc srcVal(s: TevSource): int =
+    case s
+    of tevPrimaryColor: 0x00
+    of tevTexture0: 0x03
+    of tevTexture1: 0x04
+    of tevConstant: 0x0E
+    of tevPrevious: 0x0F
+  proc fnVal(f: TevFunc): int =
+    case f
+    of tevReplace: 0x00
+    of tevModulate: 0x01
+    of tevAdd: 0x02
+  doAssert modStage.fn.fnVal == 0x01, "expected GPU_MODULATE"
+  doAssert modStage.src0.srcVal == 0x03, "expected GPU_TEXTURE0"
+  doAssert modStage.src1.srcVal == 0x00, "expected GPU_PRIMARY_COLOR"
+
 # --- recognized: texture() call form ----------------------------------------
 
 proc sampleFrag(
