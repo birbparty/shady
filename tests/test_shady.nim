@@ -384,6 +384,34 @@ block:
     fragColor = vec4(float(tile.x), 0.0, 0.0, 1.0)
   log toGLSL(desktopSamplerFrag, glslDesktop)
 
+block:
+  log "--------------------------------------------------"
+  log "GlslTarget: ES1 vertex (attribute/varying, body gl_Position):"
+  var projMat: Uniform[Mat4]
+  proc es1Vert(
+    vertexPos: Vec2,
+    vertexUv: Vec2,
+    uv: var Vec2
+  ) =
+    uv = vertexUv
+    gl_Position = projMat * vec4(vertexPos.x, vertexPos.y, 0.0, 1.0)
+  log toGLSL(es1Vert, "100")
+
+block:
+  log "--------------------------------------------------"
+  log "GlslTarget: ES1 fragment (gl_FragColor, texture2D, mediump):"
+  var es1Tex: Uniform[Sampler2d]
+  proc es1Frag(uv: Vec2, color: Vec4, fragColor: var Vec4) =
+    fragColor = texture(es1Tex, uv) * color
+  log toShader(es1Frag, glslES1, shaderFragment)
+
+block:
+  log "--------------------------------------------------"
+  log "GlslTarget: ES1 fragment with gl_FragCoord (no redeclare/qualifier):"
+  proc es1FragCoord(gl_FragCoord: Vec4, fragColor: var Vec4) =
+    fragColor = gl_FragCoord
+  log toShader(es1FragCoord, glslES1, shaderFragment)
+
 when defined(gen_master):
   writeFile(goldMasterPath, masterOutput)
 else:

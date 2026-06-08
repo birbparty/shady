@@ -1,7 +1,7 @@
 ## Shader macro, converts Nim code into shader source.
 
 import macros, pixie, strutils, tables, vmath
-import shady/backends/[glsl, glsl3, glsl4, dx12, metal4, vulkan]
+import shady/backends/[glsl, glsl1, glsl3, glsl4, dx12, metal4, vulkan]
 from chroma import ColorRGBX
 
 type
@@ -12,6 +12,7 @@ type
     vulkanGlsl450 ## GLSL 4.50 source shaped for Vulkan/SPIR-V.
     hlslDX12      ## HLSL for DirectX 12.
     metalMSL      ## Metal Shading Language.
+    glsl1WebGL    ## OpenGL ES 2.0 / WebGL 1.0 (Vita, old GLES). GLSL ES 1.00.
 
   GlslTarget* = ShaderTarget
 
@@ -29,10 +30,14 @@ type
 const
   glslDesktop* = glsl4Desktop
   glslES3* = glsl3WebGL
+  glslES1* = glsl1WebGL
 
 var useResult {.compiletime.}: bool
 var shaderTarget* {.compiletime.}: ShaderTarget
 var shaderStage* {.compiletime.}: ShaderStage
+# Under glslES1, the user fragment-output param is rewritten to gl_FragColor.
+# Holds that param's name only while the main fragment body is emitted; "" otherwise.
+var fragColorAlias {.compiletime.}: string
 
 const shaderSamplerTypes = [
   "Sampler2d", "SamplerCube", "Sampler2dShadow", "USampler2d",
@@ -47,7 +52,7 @@ proc err(msg: string, n: NimNode) {.noreturn.} =
 
 proc language(target: ShaderTarget): ShaderLanguage =
   case target
-  of glsl3WebGL, glsl3Desktop, glsl4Desktop, vulkanGlsl450:
+  of glsl1WebGL, glsl3WebGL, glsl3Desktop, glsl4Desktop, vulkanGlsl450:
     langGlsl
   of hlslDX12:
     langHlsl
@@ -364,6 +369,19 @@ proc toCode(n: NimNode, res: var string, level = 0) =
     res.addSmart ';'
 
   of nnkInfix:
+    if shaderTarget == glsl1WebGL and n.len == 3:
+      # GLSL ES 1.00 has no bitwise ops and no integer `%` operator (added in
+      # ES 3.00). `shl`/`shr` have no ES1 form at all; `and`/`or`/`xor`/`mod` are
+      # only illegal on integer operands (boolean `&&`/`||` stay legal), so test
+      # the operand type to avoid false-positive errors on logical operators.
+      let op = n[0].strVal
+      if op in ["shl", "shr"]:
+        err "[Shady] bitwise operator '" & op &
+            "' is not available in GLSL ES 1.00 (glslES1 target).", n
+      elif op in ["and", "or", "xor", "mod"] and
+          isIntegerType(typeInstRepr(n[1])):
+        err "[Shady] integer operator '" & op & "' (bitwise/modulo) is not " &
+            "available in GLSL ES 1.00 (glslES1 target).", n
     if n[0].repr in ["mod"] and not isIntegerType(n[1].getType().repr):
       # In Nim float mod and integer made are same thing.
       # In GLSL mod(float, float) is a function while % is for integers.
@@ -476,6 +494,30 @@ proc toCode(n: NimNode, res: var string, level = 0) =
     var procName = procRename(n[0].strVal)
     if procName in ignoreFunctions:
       return
+    if shaderTarget == glsl1WebGL:
+      # GLSL ES 1.00 sampler/builtin remap. `texture` is type-dependent (NOT always
+      # texture2D); the rest have no ES1 equivalent and must fail loud rather than
+      # emit something SceShaccCg chokes on at link time.
+      case n[0].strVal
+      of "texture":
+        if isShadowSamplerExpr(n[1]):
+          err "[Shady] shadow samplers are not supported under glslES1.", n
+        elif "SamplerCube" in n[1].typeInstRepr():
+          procName = "textureCube"
+        else:
+          procName = "texture2D"
+      of "textureSize", "textureGrad", "texelFetch", "textureLod",
+         "imageStore", "imageLoad":
+        err "[Shady] '" & n[0].strVal & "' has no GLSL ES 1.00 equivalent " &
+            "(glslES1 target).", n
+      of "round", "inverse":
+        err "[Shady] '" & n[0].strVal & "' is not available in GLSL ES 1.00 " &
+            "(added in ES 3.00; glslES1 target).", n
+      of "dFdx", "dFdy", "fwidth":
+        err "[Shady] derivative '" & n[0].strVal & "' requires the " &
+            "GL_OES_standard_derivatives extension and is not emitted under " &
+            "glslES1.", n
+      else: discard
     if procName == "[]=":
       n[1].toCode(res)
       for i in 2 ..< n.len - 1:
@@ -551,7 +593,12 @@ proc toCode(n: NimNode, res: var string, level = 0) =
       res.add "]"
 
   of nnkIdent, nnkSym:
-    res.add procRename(n.strVal)
+    # Under glslES1 the user fragment output is the builtin gl_FragColor.
+    if shaderTarget == glsl1WebGL and fragColorAlias.len > 0 and
+        n.strVal == fragColorAlias:
+      res.add "gl_FragColor"
+    else:
+      res.add procRename(n.strVal)
 
   of nnkStmtListExpr:
     for j in 0 ..< n.len:
@@ -750,6 +797,8 @@ proc toCode(n: NimNode, res: var string, level = 0) =
     err "Nested proc definitions are not allowed.", n
 
   of nnkCaseStmt:
+    if shaderTarget == glsl1WebGL:
+      err "[Shady] switch/case is not available in GLSL ES 1.00 (glslES1 target).", n
     res.addIndent level
     res.add "switch("
     n[0].toCode(res)
@@ -872,12 +921,27 @@ proc gatherEntryParams(formalParams: NimNode): seq[EntryParam] =
             isOut: false
           )
 
-proc resolvedStage(params: seq[EntryParam]): ShaderStage =
+proc bodyWritesGlPosition(n: NimNode): bool =
+  ## Scans an AST for a write to `gl_Position` (e.g. `gl_Position = ...`).
+  ## Needed because `gl_Position` is often a module-level global assigned in the
+  ## proc body rather than a formal param, so a params-only scan misclassifies
+  ## such a vertex shader as fragment.
+  if n.kind == nnkAsgn and n[0].kind in {nnkSym, nnkIdent} and
+      n[0].strVal == "gl_Position":
+    return true
+  for c in n:
+    if c.bodyWritesGlPosition():
+      return true
+  false
+
+proc resolvedStage(params: seq[EntryParam], body: NimNode = nil): ShaderStage =
   if shaderStage != shaderAuto:
     return shaderStage
   for p in params:
     if p.name == "gl_Position":
       return shaderVertex
+  if body != nil and body.bodyWritesGlPosition():
+    return shaderVertex
   shaderFragment
 
 proc stageId(stage: ShaderStage): int =
@@ -896,7 +960,7 @@ proc emitBackendEntry(
 ) =
   var bodyCode = ""
   body.toCodeStmts(bodyCode, 1)
-  let stage = resolvedStage(params).stageId()
+  let stage = resolvedStage(params, body).stageId()
   if isHlsl():
     res.add dx12.emitHlslEntry(params, bodyCode, stage)
   else:
@@ -909,10 +973,13 @@ proc emitBackendEntry(
     )
 
 proc resolvedEntryStage(topLevelNode: NimNode): ShaderStage =
+  var params: seq[EntryParam]
   for n in topLevelNode:
     if n.kind == nnkFormalParams:
-      return resolvedStage(gatherEntryParams(n))
-  shaderFragment
+      params = gatherEntryParams(n)
+  # Scan the whole proc (params already gathered above; the body holds any
+  # module-global `gl_Position` write).
+  resolvedStage(params, topLevelNode)
 
 proc toCodeTopLevel(
   topLevelNode: NimNode,
@@ -941,7 +1008,8 @@ proc toCodeTopLevel(
     emitBackendEntry(params, body, res, metalUniforms, metalTextures)
     return
 
-  var entryStage = shaderAuto
+  var entryStage = resolvedEntryStage(topLevelNode)
+  let es1 = shaderTarget == glsl1WebGL
   for n in topLevelNode:
     case n.kind
     of nnkEmpty:
@@ -951,7 +1019,19 @@ proc toCodeTopLevel(
     of nnkFormalParams:
       ## Main function parameters are different in they they go in as globals.
       res.addGap()
-      entryStage = resolvedStage(gatherEntryParams(n))
+      # GLSL ES 1.00 has no user-defined fragment outputs: the single user output
+      # is rewritten to the builtin gl_FragColor (declaration dropped, references
+      # renamed below and in the nnkSym arm). Detect it here, before emission.
+      if es1 and entryStage == shaderFragment:
+        var outs: seq[string]
+        for p in gatherEntryParams(n):
+          if p.isOut and p.name notin ["gl_FragColor", "gl_Position"]:
+            outs.add p.name
+        if outs.len > 1:
+          err "[Shady] glslES1 has no gl_FragData[i]: a fragment shader may " &
+              "have at most one output (got " & $outs.len & ").", n
+        if outs.len == 1:
+          fragColorAlias = outs[0]
       var inLocation = 0
       var outLocation = 0
       for paramDefs in n:
@@ -961,22 +1041,34 @@ proc toCodeTopLevel(
             let param = paramDefs[i]
             if param.strVal in ["gl_FragColor", "gl_Position"]:
               continue
+            # ES1: gl_FragCoord is a builtin (read, never declared); the user
+            # fragment output becomes gl_FragColor (also never declared).
+            if es1 and (param.strVal == "gl_FragCoord" or
+                (fragColorAlias.len > 0 and param.strVal == fragColorAlias)):
+              continue
             if typeNode.kind == nnkVarTy:
               if typeNode[0].repr == "seq":
                 res.add "buffer?"
                 res.add typeNode.repr
                 continue
               elif typeNode[0].repr == "int":
+                if es1:
+                  err "[Shady] glslES1 forbids integer varyings ('" &
+                      param.strVal & "'); ES1 varyings must be float/vec/mat.", n
                 res.add "flat "
               if isVulkan():
                 res.add "layout(location = "
                 res.add $outLocation
                 res.add ") "
                 inc outLocation
-              res.add "out "
+              # ES1 vertex outputs are `varying` (fragment outputs were skipped above).
+              res.add (if es1: "varying " else: "out ")
               res.add typeRename(typeNode[0].strVal)
             else:
               if typeNode.kind == nnkBracketExpr:
+                if es1:
+                  err "[Shady] glslES1 forbids array/struct varyings ('" &
+                      param.strVal & "').", n
                 if isVulkan():
                   res.add "layout(location = "
                   res.add $inLocation
@@ -985,16 +1077,25 @@ proc toCodeTopLevel(
                 res.add "in "
                 res.add typeString(typeNode)
               else:
-                if shaderTarget != glslES3 and param.strVal == "gl_FragCoord":
+                if shaderTarget notin {glslES3, glsl1WebGL} and
+                    param.strVal == "gl_FragCoord":
                   res.add "layout(origin_upper_left) "
                 if typeNode.strVal == "int":
+                  if es1:
+                    err "[Shady] glslES1 forbids integer varyings ('" &
+                        param.strVal & "'); ES1 varyings must be float/vec/mat.", n
                   res.add "flat "
                 if isVulkan():
                   res.add "layout(location = "
                   res.add $inLocation
                   res.add ") "
                   inc inLocation
-                res.add "in "
+                # ES1 inputs: vertex -> attribute, fragment -> varying.
+                if es1:
+                  res.add (if entryStage == shaderVertex: "attribute "
+                           else: "varying ")
+                else:
+                  res.add "in "
                 res.add typeRename(typeNode.strVal)
             res.add " "
             res.add param.strVal
@@ -1333,19 +1434,27 @@ proc toGLSLInner*(s: NimNode, version, extra: string): string =
 
   var code: string
 
+  var n = getImpl(s)
+  let entryStage = resolvedEntryStage(n)
+
   # Add shader header stuff.
   if isGlsl():
     if version.len > 0:
       code.add "#version " & version & "\n"
-    code.add extra
+    if shaderTarget == glsl1WebGL:
+      # GLSL ES 1.00 precision is stage-aware (see glsl1.nim); the passed `extra`
+      # is ignored so the string overload's desktop default can't leak in.
+      if entryStage == shaderFragment:
+        code.add glsl1WebGLFragmentExtra
+      else:
+        code.add glsl1WebGLVertexExtra
+    else:
+      code.add extra
   elif isMetal():
     code.add metalHeader
   elif isHlsl():
     code.add hlslHeader
   code.add "// from " & s.strVal & "\n"
-
-  var n = getImpl(s)
-  let entryStage = resolvedEntryStage(n)
 
   # Gather all globals and functions, and globals and functions they use.
   var functions: Table[string, string]
@@ -1442,6 +1551,7 @@ proc toGLSLInner*(s: NimNode, target: GlslTarget): string =
   ## Converts proc to a GLSL string for the given target.
   shaderTarget = target
   shaderStage = shaderAuto
+  fragColorAlias = ""
   case target
   of glsl4Desktop:
     toGLSLInner(s, glsl4DesktopVersion, glsl4DesktopExtra)
@@ -1451,6 +1561,8 @@ proc toGLSLInner*(s: NimNode, target: GlslTarget): string =
     toGLSLInner(s, glsl3DesktopVersion, glsl3DesktopExtra)
   of glsl3WebGL:
     toGLSLInner(s, glsl3WebGLVersion, glsl3WebGLExtra)
+  of glsl1WebGL:
+    toGLSLInner(s, glsl1WebGLVersion, "")
   of hlslDX12:
     toGLSLInner(s, "", "")
   of metalMSL:
@@ -1464,6 +1576,7 @@ proc toShaderInner*(
   ## Converts proc to shader source for the given target.
   shaderTarget = target
   shaderStage = stage
+  fragColorAlias = ""
   case target
   of glsl4Desktop:
     toGLSLInner(s, glsl4DesktopVersion, glsl4DesktopExtra)
@@ -1473,6 +1586,8 @@ proc toShaderInner*(
     toGLSLInner(s, glsl3DesktopVersion, glsl3DesktopExtra)
   of glsl3WebGL:
     toGLSLInner(s, glsl3WebGLVersion, glsl3WebGLExtra)
+  of glsl1WebGL:
+    toGLSLInner(s, glsl1WebGLVersion, "")
   of hlslDX12, metalMSL:
     toGLSLInner(s, "", "")
 
@@ -1490,8 +1605,14 @@ macro toGLSL*(
 ): string =
   ## Converts proc to a glsl string.
   ## For target-aware compilation, use the GlslTarget overload instead.
-  shaderTarget = if "es" in version.strVal: glslES3 else: glslDesktop
+  ## `"100"` / `"100 es"` routes to GLSL ES 1.00 (glslES1); the precision line is
+  ## emitted stage-aware (see glsl1.nim), ignoring the passed `extra`.
+  shaderTarget =
+    if version.strVal.startsWith("100"): glslES1
+    elif "es" in version.strVal: glslES3
+    else: glslDesktop
   shaderStage = shaderAuto
+  fragColorAlias = ""
   newLit(toGLSLInner(s, version.strVal, extra.strVal))
 
 macro toShader*(
