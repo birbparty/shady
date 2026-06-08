@@ -58,6 +58,17 @@ block structure:
   doAssert "mov outclr, v1" in geo and "mov outclr, v3" in geo and
            "mov outclr, v5" in geo, geo
 
+block frozenGolden:
+  # The subdivision proc is deterministic, so its full output is byte-locked as a
+  # regression golden (verified rendering identically to the devkitPro example's
+  # hand-written shader on real 3DS hardware, 2026-06-07). A diff here means the
+  # geometry emitter changed behavior — review, then regenerate the golden.
+  const golden = staticRead("golden/subdivideGeo.g.pica")
+  doAssert geo == golden,
+    "toGeoPica output drifted from the frozen golden " &
+    "(tests/golden/subdivideGeo.g.pica). If intentional, regenerate it.\n" &
+    "--- got ---\n" & geo
+
 block picassoOracle:
   let picasso = findExe("picasso")
   if picasso.len == 0:
