@@ -26,9 +26,11 @@ Current shader targets:
 * GLSL ES 3.0 via `glsl3WebGL` / `glslES3` for OpenGL ES 3.0 / WebGL 2.0.
 * HLSL via `hlslDX12` for DirectX 12.
 * Metal Shading Language via `metalMSL`.
+* PICA200 vertex assembly via `pica200Vsh` for the Nintendo 3DS (experimental —
+  vertex shaders only; see "Nintendo 3DS / PICA200" below).
 
 Use `toShader(shaderProc, target, stage)` for the general backend switch, or
-`toGLSL`, `toHLSL`, and `toMSL` for language-specific helpers.
+`toGLSL`, `toHLSL`, `toMSL`, and `toPica` for language-specific helpers.
 
 Runtime backend tests are separate so platform graphics dependencies stay
 optional:
@@ -46,6 +48,133 @@ Shady uses:
 * `vmath` library for vector and matrix operations.
 * `chroma` library for color conversions and operations.
 * `bumpy` library for collisions and intersections.
+
+# Nintendo 3DS / PICA200 (experimental)
+
+Shady can compile a **vertex** shader proc to [PICA200](https://www.3dbrew.org/wiki/GPU)
+picasso assembly (`.v.pica`) for the Nintendo 3DS via `toPica`. A shader generated
+this way has been verified rendering on **real 3DS hardware** (a Shady-generated
+2D atlas vertex shader drop-in to [boxy](https://github.com/treeform/boxy)'s
+citro3d backend renders identically to the hand-written one).
+
+```nim
+import shady, vmath
+
+proc basicVert(
+  gl_Position: var Vec4,
+  projection: Uniform[Mat4],
+  vPos: Vec3
+) =
+  gl_Position = projection * vec4(vPos.x, vPos.y, vPos.z, 1.0)
+
+const picaSource = toPica(basicVert)
+# Assemble with devkitPro's picasso, then load the .shbin via libctru/citro3d:
+#   picasso basicVert.v.pica -o basicVert.shbin
+
+# Or skip the file entirely — assemble with picasso at compile time and embed
+# the .shbin bytes inline (requires picasso on PATH; only runs when you call it):
+const shbinBytes = toPicaShbin(basicVert)   # ready for DVLB_ParseFile
+```
+
+Output:
+
+```
+.fvec projection[4]
+.out outpos position
+.alias vPos v0
+
+.proc main
+	mov r0.x, v0.x
+	mov r0.y, v0.y
+	mov r0.z, v0.z
+	mov r0.w, shady_c0.x
+	dp4 outpos.x, projection[0], r0
+	dp4 outpos.y, projection[1], r0
+	dp4 outpos.z, projection[2], r0
+	dp4 outpos.w, projection[3], r0
+	end
+.end
+```
+
+**Important hardware constraints** (these are PICA200 facts, not Shady choices):
+
+* **Vertex shaders only.** The PICA200 has **no programmable fragment stage** —
+  per-pixel color comes from the fixed-function TEV combiners, configured on the
+  CPU via citro3d. `toPica` rejects fragment shaders at compile time.
+* **Param conventions.** Plain vector/float params become vertex attributes
+  (`v0`, `v1`, …, in declaration order); a `Uniform[Mat4]`/`Uniform[Vec4]` param
+  becomes a `.fvec` uniform (resolved by name on the host); a `var` output maps
+  to a PICA output semantic (`position`/`texcoord0`/`color`) chosen by name.
+* **Supported:** straight-line transforms, `if`/`elif`/`else` (→ `cmp` + `ifc`),
+  local `let`/`var` (incl. mutable accumulation), and `for` loops with
+  **constant** bounds (unrolled). Shaders needing more than the 16 temp registers
+  are rejected with a clear compile error (the PICA200 has no register spilling).
+* **Geometry shaders** are supported via `toGeoPica` (see below).
+* **Not yet:** uniform-bounded (`.ivec`) hardware loops — these hard-error for now.
+
+## Geometry shaders (`toGeoPica`)
+
+The PICA200 also has a programmable **geometry** stage. `toGeoPica` compiles a
+Nim proc that takes a `Primitive[N, T]` input and emits output vertices with
+`emitVertex`/`endPrimitive` to picasso `.g.pica` assembly:
+
+```nim
+type GeoVertex = object   # fields mirror the pass-through vertex shader's outputs
+  position: Vec4
+  color: Vec4
+
+# Subdivide each input triangle into three (midpoint subdivision).
+proc subdivideGeo(prim: Primitive[3, GeoVertex], projection: Uniform[Mat4]) =
+  let m0 = (prim[0].position + prim[1].position) * 0.5
+  let m1 = (prim[1].position + prim[2].position) * 0.5
+  let m2 = (prim[2].position + prim[0].position) * 0.5
+  emitVertex(projection * prim[0].position, prim[0].color)
+  emitVertex(projection * m0, prim[1].color)
+  emitVertex(projection * m2, prim[2].color)
+  endPrimitive()
+  # ... two more triangles ...
+
+const geoSource = toGeoPica(subdivideGeo)
+```
+
+A geometry program is **one shbin with two DVLEs** — a pass-through vertex shader
+(`DVLE[0]`) and the geometry shader (`DVLE[1]`) — assembled together in one
+picasso call (`picasso pass.v.pica geo.g.pica -o out.shbin`) and loaded with
+`shaderProgramSetGsh(dvle1, stride)`. The host stride = (vsh output registers) ×
+(vertices per primitive). v1 targets the devkitPro `geoshader` example's shape
+(`GSH_POINT`, 3-vertex triangles, ≤3 emits per output primitive); other modes
+hard-error. This was verified by reproducing that example's shader from Nim and
+assembling it into the example unchanged.
+* Integer vertex attributes (e.g. `GPU_UNSIGNED_BYTE` colors) arrive
+  **un-normalized**; divide by 255 in the shader if you need `[0,1]`.
+
+## Fragments on the 3DS: there is no programmable fragment stage
+
+The PICA200 has **no programmable fragment shader** — per-pixel color comes from
+up to six fixed-function **TEV** (texture-environment combiner) stages configured
+on the CPU via citro3d. Shady can't compile an arbitrary fragment shader for it.
+What it *can* do is recognize the handful of shapes 2D rendering needs and emit a
+fixed-function TEV descriptor with `toTev`:
+
+```nim
+proc modulateFrag(fragColor: var Vec4, texColor: Vec4, vertColor: Vec4) =
+  fragColor = texColor * vertColor          # texture x vertex color
+
+const stage = toTev(modulateFrag)
+# stage.fn == tevModulate; stage.src0 == tevTexture0; stage.src1 == tevPrimaryColor
+# stage.fn.gpuFunc == "GPU_MODULATE"  (map to citro3d C3D_TexEnv* on the host)
+```
+
+Recognized: `Replace` (texture only), `Modulate` (texture × color), `Add`.
+**Everything else hard-errors** ("the 3DS has no programmable fragment stage") —
+`toTev` is a recognizer for a few fixed-function configurations, not a compiler.
+
+Building Shady-consuming code for the 3DS (cross-compiled with devkitARM) should
+pass **`-d:shadyNoPixie`** so the CPU-simulation runtime (which needs `pixie`) is
+not compiled into the ARM binary — the shader codegen itself needs no pixie.
+
+`tests/test_pica.nim` exercises `toPica` and, when `picasso` is on `PATH`, checks
+that the generated assembly actually assembles.
 
 # Using Shady shader toy playground:
 

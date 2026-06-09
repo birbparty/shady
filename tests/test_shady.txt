@@ -507,3 +507,44 @@ void main() {
   fragColor = vec4(float(float(tile.x)), 0.0, 0.0, 1.0);
 }
 
+--------------------------------------------------
+GlslTarget: ES1 vertex (attribute/varying, body gl_Position):
+#version 100
+// from es1Vert
+
+uniform mat4 projMat;
+
+attribute vec2 vertexPos;
+attribute vec2 vertexUv;
+varying vec2 uv;
+
+void main() {
+  uv = vertexUv;
+  gl_Position = projMat * vec4(vertexPos.x, vertexPos.y, 0.0, 1.0);
+}
+
+--------------------------------------------------
+GlslTarget: ES1 fragment (gl_FragColor, texture2D, mediump):
+#version 100
+precision mediump float;
+// from es1Frag
+
+uniform sampler2D es1Tex;
+
+varying vec2 uv;
+varying vec4 color;
+
+void main() {
+  gl_FragColor = texture2D(es1Tex, uv) * color;
+}
+
+--------------------------------------------------
+GlslTarget: ES1 fragment with gl_FragCoord (no redeclare/qualifier):
+#version 100
+precision mediump float;
+// from es1FragCoord
+
+void main() {
+  gl_FragColor = gl_FragCoord;
+}
+

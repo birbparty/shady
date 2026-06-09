@@ -211,4 +211,63 @@ block:
   doAssert "layout(location = 1) in vec4 fragmentColor;" in vulkanFragment
   doAssert "layout(location = 0) out vec4 fragColor;" in vulkanFragment
 
+block:
+  # GLSL ES 1.00 (glslES1) target: attribute/varying, gl_FragColor, texture2D,
+  # stage-aware mandatory precision, and fail-loud guards.
+  var es1Sampler: Uniform[Sampler2d]
+
+  proc es1Vertex(
+    vertexPos: Vec2,
+    vertexUv: Vec2,
+    uv: var Vec2
+  ) =
+    uv = vertexUv
+    gl_Position = vec4(vertexPos.x, vertexPos.y, 0.0, 1.0)
+
+  proc es1Fragment(uv: Vec2, fragColor: var Vec4) =
+    fragColor = texture(es1Sampler, uv)
+
+  # Stage from body-scan: gl_Position is a module-global written in the body, and
+  # the string overload "100" carries no stage argument.
+  let es1Vert = toGLSL(es1Vertex, "100")
+  doAssert "#version 100" in es1Vert
+  doAssert "attribute vec2 vertexPos;" in es1Vert
+  doAssert "varying vec2 uv;" in es1Vert
+  doAssert "in vec2" notin es1Vert
+  doAssert "out vec2" notin es1Vert
+  doAssert "precision" notin es1Vert  # vertex defaults to highp; no precision line
+
+  let es1Frag = toShader(es1Fragment, glslES1, shaderFragment)
+  doAssert "#version 100" in es1Frag
+  doAssert "precision mediump float;" in es1Frag
+  doAssert "gl_FragColor = texture2D(es1Sampler, uv)" in es1Frag
+  doAssert "varying vec2 uv;" in es1Frag
+  doAssert "out vec4 fragColor;" notin es1Frag  # user output dropped
+  doAssert "texture2D" in es1Frag and "texture(" notin es1Frag
+
+  # Fail-loud: constructs ES1 cannot legally express must not compile under glslES1,
+  # while remaining valid under ES3/desktop.
+  proc usesRound(uv: Vec2, fragColor: var Vec4) =
+    fragColor = vec4(round(uv.x))
+  proc usesSwitch(k: int, fragColor: var Vec4) =
+    case k
+    of 0: fragColor = vec4(0.0)
+    else: fragColor = vec4(1.0)
+  proc usesTexSize(t: Uniform[Sampler2d], fragColor: var Vec4) =
+    fragColor = vec4(textureSize(t, 0).x)
+  proc intVarying(flag: int, fragColor: var Vec4) =
+    fragColor = vec4(float(flag))
+  proc multiOut(uv: Vec2, a: var Vec4, b: var Vec4) =
+    a = vec4(0.0)
+    b = vec4(1.0)
+
+  doAssert not compiles(toShader(usesRound, glslES1, shaderFragment))
+  doAssert not compiles(toShader(usesSwitch, glslES1, shaderFragment))
+  doAssert not compiles(toShader(usesTexSize, glslES1, shaderFragment))
+  doAssert not compiles(toShader(intVarying, glslES1, shaderFragment))
+  doAssert not compiles(toShader(multiOut, glslES1, shaderFragment))
+  # No false positives on other targets.
+  doAssert compiles(toShader(usesRound, glslES3, shaderFragment))
+  doAssert compiles(toShader(usesSwitch, glsl4Desktop, shaderFragment))
+
 echo "Backend codegen tests passed"
