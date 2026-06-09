@@ -11,11 +11,15 @@
 ## binary. The shader codegen never calls these procs; it recognizes
 ## `texture`/`imageStore`/`texelFetch`/etc. as builtins by name.
 
-import std/math, vmath, pixie
+import std/math, vmath
+import pixie/images   # decoder-free raster/Image API — avoids compiling pixie's
+                      # PNG/JPEG/zippy decoders into consumers (esp. 3DS builds
+                      # that opt cpusim back in). See pixie PR birbparty/pixie#1.
+import chroma         # rgbx / ColorRGBX (pixie/images re-exports these once #1
+                      # lands; imported explicitly so this works on pixie 6.1.0).
 import shady/backends/shared
-from chroma import ColorRGBX
 
-export pixie
+export images, chroma
 
 type
   ImageBuffer* = object
